@@ -1,0 +1,38 @@
+[workspace]
+# Runnable products live under apps/. Add shared library crates under crates/ when
+# both the server and CLI need the same domain logic, config, or API types.
+members = [
+    "apps/server",
+    "apps/cli",
+    "crates/core",
+    "crates/config",
+    "crates/protocol",
+]
+resolver = "3"
+
+[workspace.package]
+# Package metadata is centralized so all workspace crates stay versioned together.
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# Keep third-party versions here so apps use the same dependency graph.
+agentic-config = { path = "crates/config" }
+agentic-core = { path = "crates/core" }
+agentic-protocol = { path = "crates/protocol" }
+axum = "0.8"
+color-eyre = "0.6"
+crossterm = "0.29"
+ratatui = "0.30"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+# Release settings apply to installable binaries such as the CLI and server.
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

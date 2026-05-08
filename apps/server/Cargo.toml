@@ -1,0 +1,16 @@
+[package]
+# This package is a runnable Axum service, so it belongs under apps/.
+name = "server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Versions are inherited from the workspace root to keep app dependencies aligned.
+agentic-config.workspace = true
+agentic-core.workspace = true
+agentic-protocol.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

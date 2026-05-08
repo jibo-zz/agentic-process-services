@@ -1,0 +1,26 @@
+# AGENTS.md
+
+## Repo Shape
+- Rust 2024 Cargo workspace with resolver `3`; root `Cargo.toml` is the source of truth for members and shared dependency versions.
+- Runnable products live in `apps/`: `apps/server` is the Axum HTTP service, `apps/cli` is the Ratatui/Crossterm TUI.
+- Shared libraries live in `crates/`; do not couple `apps/server` and `apps/cli` directly.
+- `crates/core` holds shared domain constants and future domain logic used across runnable apps.
+- `crates/config` holds shared configuration loading; server address configuration currently comes from `APS_SERVER_ADDR` and defaults to `127.0.0.1:3000`.
+- `crates/protocol` holds shared API/client DTOs used by the server and future CLI clients, such as the `/health` response shape.
+
+## Commands
+- Check everything: `cargo check --workspace`.
+- Run tests: `cargo test --workspace`; focused tests use `cargo test -p server <test_name>` or `cargo test -p cli <test_name>`.
+- Formatting check: `cargo fmt --all -- --check`; apply formatting with `cargo fmt --all`.
+- Lint all targets: `cargo clippy --workspace --all-targets`.
+- Run the server: `cargo run -p server`; it binds `127.0.0.1:3000` and exposes `GET /health`.
+- Run the server on another address: `APS_SERVER_ADDR=127.0.0.1:4000 cargo run -p server`.
+- Run the TUI: `cargo run -p cli`; it takes over the terminal alternate screen and exits on `q` or `Esc`.
+
+## Runtime Notes
+- Server logging uses `tracing_subscriber` with `RUST_LOG` support and defaults to `server=info`.
+- The server returns shared protocol DTOs from `agentic-protocol`; keep API response structs there if the CLI will consume them later.
+- Keep config parsing in `agentic-config` when both apps may need the same environment variables or defaults.
+- Keep product/domain names and cross-app constants in `agentic-core` to avoid duplicated strings.
+- There is no repo-local README, CI, task runner, formatter config, or pre-commit config yet; prefer Cargo commands over inventing project scripts.
+- Release profile is optimized for installable binaries (`lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`).
