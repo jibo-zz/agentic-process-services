@@ -8,6 +8,15 @@
 - `crates/config` holds shared configuration loading; server address configuration currently comes from `APS_SERVER_ADDR` and defaults to `127.0.0.1:3000`.
 - `crates/protocol` holds shared API/client DTOs used by the server and future CLI clients, such as the `/health` response shape.
 
+## Code Organization
+- Use Rust module filenames in `snake_case`; keep module names focused on responsibility, not implementation detail.
+- Keep app entrypoints thin: `main.rs` should install error/panic handling and delegate to product modules.
+- In `apps/cli`, prefer the current separation: `app` for state/input handling, `tui` for terminal setup/event loop, and `ui` modules for rendering/widgets.
+- Put screen-specific Ratatui widgets and layout helpers under `ui/<screen>.rs`; only expose the small render surface needed by callers.
+- For CLI navigation, prefer typed slash commands like `/home`, `/about`, and `/settings` over shortcut-only page switching; unknown slash routes should render a Not Found page for that route.
+- For textarea-like input, keep keybindings explicit in app state; current convention is `Enter` submits and `Ctrl+Enter`/`Alt+Enter` insert newlines.
+- Avoid letting product apps share code with each other directly; move reusable config, protocol, or domain code into `crates/`.
+
 ## Commands
 - Check everything: `cargo check --workspace`.
 - Run tests: `cargo test --workspace`; focused tests use `cargo test -p server <test_name>` or `cargo test -p cli <test_name>`.
@@ -15,7 +24,7 @@
 - Lint all targets: `cargo clippy --workspace --all-targets`.
 - Run the server: `cargo run -p server`; it binds `127.0.0.1:3000` and exposes `GET /health`.
 - Run the server on another address: `APS_SERVER_ADDR=127.0.0.1:4000 cargo run -p server`.
-- Run the TUI: `cargo run -p cli`; it takes over the terminal alternate screen and exits on `q` or `Esc`.
+- Run the TUI: `cargo run -p cli`; it takes over the terminal alternate screen and exits on `Esc` or `Ctrl+C`.
 
 ## Runtime Notes
 - Server logging uses `tracing_subscriber` with `RUST_LOG` support and defaults to `server=info`.
