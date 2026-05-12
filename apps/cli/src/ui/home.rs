@@ -1,4 +1,4 @@
-use crate::app::{App, MessageRole};
+use crate::app::App;
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Constraint, Flex, Layout, Rect},
@@ -38,44 +38,20 @@ impl Widget for HomeScreen<'_> {
             .margin(1)
             .areas(home);
 
-        render_home(inner, buf, self.app);
+        let landing = centered_rect(inner, inner.width.min(82), 17);
+        let [brand, prompt, footer] = Layout::vertical([
+            Constraint::Length(9),
+            Constraint::Length(7),
+            Constraint::Length(1),
+        ])
+        .spacing(1)
+        .areas(landing);
+
+        LandingHeader.render(brand, buf);
+        HomeTextArea::new(self.app.input(), self.app.text_area_key_bindings_hint())
+            .render(prompt, buf);
+        StatusFooter::new(self.app.input_len()).render(footer, buf);
     }
-}
-
-fn render_home(area: Rect, buf: &mut Buffer, app: &App) {
-    if app.messages().is_empty() {
-        render_landing_home(area, buf, app);
-        return;
-    }
-
-    let [brand, session, prompt, footer] = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Fill(1),
-        Constraint::Length(7),
-        Constraint::Length(1),
-    ])
-    .spacing(1)
-    .areas(area);
-
-    CompactHeader.render(brand, buf);
-    SessionTranscript::new(app).render(session, buf);
-    HomeTextArea::new(app.input(), app.text_area_key_bindings_hint()).render(prompt, buf);
-    StatusFooter::new(app.input_len()).render(footer, buf);
-}
-
-fn render_landing_home(area: Rect, buf: &mut Buffer, app: &App) {
-    let landing = centered_rect(area, area.width.min(82), 17);
-    let [brand, prompt, footer] = Layout::vertical([
-        Constraint::Length(9),
-        Constraint::Length(7),
-        Constraint::Length(1),
-    ])
-    .spacing(1)
-    .areas(landing);
-
-    LandingHeader.render(brand, buf);
-    HomeTextArea::new(app.input(), app.text_area_key_bindings_hint()).render(prompt, buf);
-    StatusFooter::new(app.input_len()).render(footer, buf);
 }
 
 struct LandingHeader;
@@ -95,71 +71,6 @@ impl Widget for LandingHeader {
         Paragraph::new(Text::from(lines))
             .alignment(Alignment::Center)
             .render(area, buf);
-    }
-}
-
-struct CompactHeader;
-
-impl Widget for CompactHeader {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let text = Line::from(vec![
-            "Faaido".bold().cyan(),
-            "  ".into(),
-            APP_SUBTITLE.dim(),
-        ]);
-
-        Paragraph::new(text)
-            .alignment(Alignment::Center)
-            .render(area, buf);
-    }
-}
-
-struct SessionTranscript<'a> {
-    app: &'a App,
-}
-
-impl<'a> SessionTranscript<'a> {
-    fn new(app: &'a App) -> Self {
-        Self { app }
-    }
-}
-
-impl Widget for SessionTranscript<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let content = centered_rect(area, area.width.min(76), area.height);
-        let mut lines = Vec::new();
-
-        for message in self.app.messages() {
-            let author = match message.role() {
-                MessageRole::Assistant => "Faaido".bold().cyan(),
-                MessageRole::User => "You".bold().green(),
-            };
-
-            for (index, line) in message.content().lines().enumerate() {
-                let content = match message.role() {
-                    MessageRole::Assistant => line.dim(),
-                    MessageRole::User => line.into(),
-                };
-
-                if index == 0 {
-                    lines.push(Line::from(vec![author.clone(), "  ".into(), content]));
-                } else {
-                    lines.push(Line::from(vec!["        ".into(), content]));
-                }
-            }
-
-            lines.push(Line::from(""));
-        }
-
-        let max_lines = content.height as usize;
-        if lines.len() > max_lines {
-            let hidden_lines = lines.len() - max_lines;
-            lines = lines.into_iter().skip(hidden_lines).collect();
-        }
-
-        Paragraph::new(Text::from(lines))
-            .wrap(Wrap { trim: true })
-            .render(content, buf);
     }
 }
 
@@ -223,10 +134,6 @@ impl Widget for StatusFooter {
     fn render(self, area: Rect, buf: &mut Buffer) {
         Paragraph::new(Line::from(vec![
             " HOME ".bold().on_dark_gray(),
-            " home ".dim(),
-            "  ".into(),
-            "/about ".bold().cyan(),
-            "/settings ".bold().cyan(),
             "  ".into(),
             "INPUT ".bold().green(),
             format!("{} chars", self.input_len).dim(),

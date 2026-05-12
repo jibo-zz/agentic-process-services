@@ -24,8 +24,11 @@ agentic-protocol = { path = "crates/protocol" }
 axum = "0.8"
 color-eyre = "0.6"
 crossterm = "0.29"
+dotenvy = "0.15"
+futures-util = "0.3"
 ratatui = "0.30"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rig-core = "0.36"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }

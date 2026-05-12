@@ -1,11 +1,12 @@
+use crate::sessions::{self, Session};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Clone, Default, Eq, PartialEq)]
 pub enum Route {
     #[default]
     Home,
-    About,
-    Settings,
+    Chat,
+    Sessions,
     Missing(String),
 }
 
@@ -13,56 +14,28 @@ impl Route {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Home => "home",
-            Self::About => "about",
-            Self::Settings => "settings",
+            Self::Chat => "chat",
+            Self::Sessions => "sessions",
             Self::Missing(_) => "missing",
         }
     }
 }
 
-#[derive(Clone, Copy)]
-pub enum MessageRole {
-    Assistant,
-    User,
-}
-
-pub struct SessionMessage {
-    role: MessageRole,
-    content: String,
-}
-
-impl SessionMessage {
-    pub fn new(role: MessageRole, content: impl Into<String>) -> Self {
-        Self {
-            role,
-            content: content.into(),
-        }
-    }
-
-    pub fn role(&self) -> MessageRole {
-        self.role
-    }
-
-    pub fn content(&self) -> &str {
-        &self.content
-    }
-}
-
 #[derive(Default)]
-pub enum ServerHealth {
+pub enum ChatStream {
     #[default]
-    Unknown,
-    Up {
-        service: String,
-        status: String,
-    },
-    Down(String),
-    Error(String),
+    Idle,
+    Pending(String),                                  // user message, not yet sent
+    Streaming { user_msg: String, response: String }, // live turn
 }
 
-impl ServerHealth {
-    pub fn is_unknown(&self) -> bool {
-        matches!(self, Self::Unknown)
+impl ChatStream {
+    pub fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending(_))
+    }
+
+    pub fn pending_prompt(&self) -> Option<&str> {
+        if let Self::Pending(p) = self { Some(p) } else { None }
     }
 }
 
@@ -84,7 +57,6 @@ impl TextAreaKeyBinding {
     fn matches(&self, key: KeyEvent) -> bool {
         key.code == self.code && key.modifiers == self.modifiers
     }
-
     fn display_name(&self) -> String {
         if self.modifiers == KeyModifiers::CONTROL {
             format!("Ctrl+{}", self.name)
@@ -97,169 +69,194 @@ impl TextAreaKeyBinding {
 }
 
 const TEXTAREA_KEY_BINDINGS: &[TextAreaKeyBinding] = &[
-    TextAreaKeyBinding {
-        name: "return",
-        code: KeyCode::Enter,
-        modifiers: KeyModifiers::NONE,
-        action: TextAreaAction::Submit,
-    },
-    TextAreaKeyBinding {
-        name: "return",
-        code: KeyCode::Enter,
-        modifiers: KeyModifiers::CONTROL,
-        action: TextAreaAction::InsertNewline,
-    },
-    TextAreaKeyBinding {
-        name: "return",
-        code: KeyCode::Enter,
-        modifiers: KeyModifiers::ALT,
-        action: TextAreaAction::InsertNewline,
-    },
-    TextAreaKeyBinding {
-        name: "backspace",
-        code: KeyCode::Backspace,
-        modifiers: KeyModifiers::NONE,
-        action: TextAreaAction::Backspace,
-    },
+    TextAreaKeyBinding { name: "return", code: KeyCode::Enter, modifiers: KeyModifiers::NONE, action: TextAreaAction::Submit },
+    TextAreaKeyBinding { name: "return", code: KeyCode::Enter, modifiers: KeyModifiers::CONTROL, action: TextAreaAction::InsertNewline },
+    TextAreaKeyBinding { name: "return", code: KeyCode::Enter, modifiers: KeyModifiers::ALT, action: TextAreaAction::InsertNewline },
+    TextAreaKeyBinding { name: "backspace", code: KeyCode::Backspace, modifiers: KeyModifiers::NONE, action: TextAreaAction::Backspace },
 ];
 
 #[derive(Default)]
 pub struct App {
-    route: Route,
+    pub route: Route,
     input: String,
-    messages: Vec<SessionMessage>,
-    server_health: ServerHealth,
+    // chat
+    pub active_session: Option<Session>,
+    pub chat_stream: ChatStream,
+    pub chat_scroll: u16,
+    // sessions list
+    pub sessions_list: Vec<Session>,
+    pub sessions_cursor: usize,
+    pub sessions_scroll: u16,
 }
 
 impl App {
-    pub fn route(&self) -> &Route {
-        &self.route
+    pub fn route(&self) -> &Route { &self.route }
+    pub fn input(&self) -> &str { &self.input }
+    pub fn input_len(&self) -> usize { self.input.len() }
+    pub fn chat_stream(&self) -> &ChatStream { &self.chat_stream }
+    pub fn chat_scroll(&self) -> u16 { self.chat_scroll }
+    pub fn set_chat_scroll(&mut self, v: u16) { self.chat_scroll = v; }
+    pub fn scroll_chat_up(&mut self) { self.chat_scroll = self.chat_scroll.saturating_sub(1); }
+    pub fn scroll_chat_down(&mut self) { self.chat_scroll = self.chat_scroll.saturating_add(1); }
+    pub fn scroll_chat_to_bottom(&mut self) { self.chat_scroll = u16::MAX; }
+
+    /// Called by tui.rs when it picks up the Pending state and spawns the task.
+    pub fn start_chat_stream(&mut self) {
+        if let ChatStream::Pending(user_msg) = std::mem::take(&mut self.chat_stream) {
+            self.chat_stream = ChatStream::Streaming { user_msg, response: String::new() };
+        }
     }
 
-    pub fn input(&self) -> &str {
-        &self.input
+    pub fn append_chat_chunk(&mut self, text: &str) {
+        if let ChatStream::Streaming { response, .. } = &mut self.chat_stream {
+            response.push_str(text);
+        }
     }
 
-    pub fn input_len(&self) -> usize {
-        self.input.len()
+    /// Saves the completed turn into the session and persists to disk.
+    pub fn finish_chat_stream(&mut self) {
+        if let ChatStream::Streaming { user_msg, response } = std::mem::take(&mut self.chat_stream)
+            && let Some(session) = &mut self.active_session
+        {
+            session.turns.push(sessions::Turn { user: user_msg, assistant: response });
+            sessions::save(session);
+        }
     }
 
-    pub fn messages(&self) -> &[SessionMessage] {
-        &self.messages
-    }
-
-    pub fn server_health(&self) -> &ServerHealth {
-        &self.server_health
-    }
-
-    pub fn reset_server_health(&mut self) {
-        self.server_health = ServerHealth::Unknown;
-    }
-
-    pub fn set_server_up(&mut self, service: impl Into<String>, status: impl Into<String>) {
-        self.server_health = ServerHealth::Up {
-            service: service.into(),
-            status: status.into(),
-        };
-    }
-
-    pub fn set_server_down(&mut self, error: impl Into<String>) {
-        self.server_health = ServerHealth::Down(error.into());
-    }
-
-    pub fn set_server_error(&mut self, error: impl Into<String>) {
-        self.server_health = ServerHealth::Error(error.into());
+    pub fn set_chat_error(&mut self, error: impl Into<String>) {
+        let msg = error.into();
+        if let Some(session) = &mut self.active_session {
+            let user_msg = match std::mem::take(&mut self.chat_stream) {
+                ChatStream::Streaming { user_msg, .. } => user_msg,
+                _ => String::new(),
+            };
+            session.turns.push(sessions::Turn {
+                user: user_msg,
+                assistant: format!("Error: {msg}"),
+            });
+            sessions::save(session);
+        }
+        self.chat_stream = ChatStream::Idle;
     }
 
     pub fn text_area_key_bindings_hint(&self) -> String {
         let submit = key_binding_names(TextAreaAction::Submit).join("/");
         let newline = key_binding_names(TextAreaAction::InsertNewline).join("/");
-
         format!("{submit}: send  {newline}: newline")
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
-            KeyCode::Esc => true,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
-            _ if self.handle_text_area_key(key) => false,
-            KeyCode::Char(character) => {
-                self.input.push(character);
+            // Esc on sessions goes back to home; everywhere else it quits
+            KeyCode::Esc if matches!(self.route, Route::Sessions) => {
+                self.route = Route::Home;
                 false
             }
+            KeyCode::Esc => true,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
+
+            // Sessions list navigation
+            KeyCode::Up if matches!(self.route, Route::Sessions) => {
+                self.sessions_cursor = self.sessions_cursor.saturating_sub(1);
+                false
+            }
+            KeyCode::Down if matches!(self.route, Route::Sessions) => {
+                let max = self.sessions_list.len().saturating_sub(1);
+                self.sessions_cursor = (self.sessions_cursor + 1).min(max);
+                false
+            }
+            KeyCode::Enter if matches!(self.route, Route::Sessions) => {
+                self.open_selected_session();
+                false
+            }
+
+            // Chat scroll
+            KeyCode::Up if matches!(self.route, Route::Chat) => { self.scroll_chat_up(); false }
+            KeyCode::Down if matches!(self.route, Route::Chat) => { self.scroll_chat_down(); false }
+
+            // Text input (only on routes that have an input box)
+            _ if matches!(self.route, Route::Sessions) => false,
+            _ if self.handle_text_area_key(key) => false,
+            KeyCode::Char(c) => { self.input.push(c); false }
             _ => false,
         }
     }
 
     fn handle_text_area_key(&mut self, key: KeyEvent) -> bool {
-        let Some(binding) = TEXTAREA_KEY_BINDINGS
-            .iter()
-            .find(|binding| binding.matches(key))
-        else {
+        let Some(binding) = TEXTAREA_KEY_BINDINGS.iter().find(|b| b.matches(key)) else {
             return false;
         };
-
         match binding.action {
             TextAreaAction::Submit => self.submit_prompt(),
             TextAreaAction::InsertNewline => self.input.push('\n'),
-            TextAreaAction::Backspace => {
-                self.input.pop();
-            }
+            TextAreaAction::Backspace => { self.input.pop(); }
         }
-
         true
     }
 
     fn submit_prompt(&mut self) {
         let prompt = self.input.trim().to_owned();
-
-        if prompt.is_empty() {
-            return;
-        }
+        if prompt.is_empty() { return; }
 
         if self.handle_route_command(&prompt) {
             self.input.clear();
             return;
         }
 
-        if !matches!(self.route, Route::Home) {
-            self.route = Route::Home;
+        // Ignore submissions while a stream is active
+        if matches!(self.chat_stream, ChatStream::Streaming { .. } | ChatStream::Pending(_)) {
+            self.input.clear();
+            return;
         }
 
-        self.messages
-            .push(SessionMessage::new(MessageRole::User, prompt));
-        self.messages.push(SessionMessage::new(
-            MessageRole::Assistant,
-            "I can turn that into a process plan once workflow execution is wired in.",
-        ));
+        if matches!(self.route, Route::Chat) {
+            // Follow-up message in current session
+            self.chat_stream = ChatStream::Pending(prompt);
+            self.scroll_chat_to_bottom();
+        } else {
+            // New session from home (or wherever)
+            let session = Session::new(&prompt);
+            self.active_session = Some(session);
+            self.chat_stream = ChatStream::Pending(prompt);
+            self.route = Route::Chat;
+            self.chat_scroll = 0;
+            self.scroll_chat_to_bottom();
+        }
+
         self.input.clear();
     }
 
     fn handle_route_command(&mut self, prompt: &str) -> bool {
-        let Some(command) = prompt.strip_prefix('/') else {
-            return false;
-        };
-
+        let Some(command) = prompt.strip_prefix('/') else { return false; };
         let normalized = command.trim_end_matches('/').to_ascii_lowercase();
-
         match normalized.as_str() {
             "home" => self.route = Route::Home,
-            "about" => {
-                self.route = Route::About;
-                self.reset_server_health();
+            "sessions" => {
+                self.sessions_list = sessions::load_all();
+                self.sessions_cursor = 0;
+                self.sessions_scroll = 0;
+                self.route = Route::Sessions;
             }
-            "settings" => self.route = Route::Settings,
             _ => self.route = Route::Missing(format!("/{command}")),
         }
-
         true
+    }
+
+    fn open_selected_session(&mut self) {
+        let Some(session) = self.sessions_list.get(self.sessions_cursor).cloned() else {
+            return;
+        };
+        self.active_session = Some(session);
+        self.chat_stream = ChatStream::Idle;
+        self.chat_scroll = u16::MAX;
+        self.route = Route::Chat;
     }
 }
 
 fn key_binding_names(action: TextAreaAction) -> Vec<String> {
     TEXTAREA_KEY_BINDINGS
         .iter()
-        .filter(|binding| binding.action == action)
+        .filter(|b| b.action == action)
         .map(TextAreaKeyBinding::display_name)
         .collect()
 }

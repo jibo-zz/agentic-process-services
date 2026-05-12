@@ -1,67 +1,14 @@
-use crate::app::{App, ServerHealth};
+use crate::app::App;
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Constraint, Flex, Layout, Rect},
     style::Style,
     style::Stylize,
     text::{Line, Text},
-    widgets::{Block, BorderType, Borders, Padding, Paragraph, Widget, Wrap},
+    widgets::{Block, BorderType, Padding, Paragraph, Widget, Wrap},
 };
 
-const COMMAND_PLACEHOLDER: &str = "Type /home, /about, or /settings...";
-
-pub struct AboutPage<'a> {
-    app: &'a App,
-}
-
-impl<'a> AboutPage<'a> {
-    pub fn new(app: &'a App) -> Self {
-        Self { app }
-    }
-}
-
-impl Widget for AboutPage<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let health = match self.app.server_health() {
-            ServerHealth::Unknown => "Server: checking...".to_owned(),
-            ServerHealth::Up { service, status } => {
-                format!("Server: UP - {service} reports {status}")
-            }
-            ServerHealth::Down(error) => format!("Server: DOWN - {error}"),
-            ServerHealth::Error(error) => format!("Server: ERROR - {error}"),
-        };
-
-        PageShell::new(
-            self.app,
-            "About",
-            "Faaido is an agentic process workspace.",
-            &health,
-        )
-        .render(area, buf);
-    }
-}
-
-pub struct SettingsPage<'a> {
-    app: &'a App,
-}
-
-impl<'a> SettingsPage<'a> {
-    pub fn new(app: &'a App) -> Self {
-        Self { app }
-    }
-}
-
-impl Widget for SettingsPage<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        PageShell::new(
-            self.app,
-            "Settings",
-            "Configuration controls will appear here.",
-            "Shared config should stay in agentic-config when both apps need it.",
-        )
-        .render(area, buf);
-    }
-}
+const COMMAND_PLACEHOLDER: &str = "Type /home, /sessions, or any slash command...";
 
 pub struct MissingPage<'a> {
     app: &'a App,
@@ -80,7 +27,7 @@ impl Widget for MissingPage<'_> {
             self.app,
             "Not Found",
             self.path,
-            "That page does not exist. Try /home, /about, or /settings.",
+            "That page does not exist. Try /home.",
         )
         .render(area, buf);
     }
@@ -125,7 +72,7 @@ impl Widget for PageShell<'_> {
             Line::from(""),
             Line::from(vec![
                 "Commands".bold().green(),
-                "  /home  /about  /settings".dim(),
+                "  /home  /sessions".dim(),
             ]),
         ]);
 
@@ -167,6 +114,8 @@ impl<'a> CommandInput<'a> {
 
 impl Widget for CommandInput<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        use ratatui::widgets::Borders;
+
         let text = if self.input.is_empty() {
             Text::from(Line::from(COMMAND_PLACEHOLDER.dim()))
         } else {
@@ -197,8 +146,6 @@ fn render_footer(app: &App, area: Rect, buf: &mut Buffer) {
         " PAGE ".bold().on_dark_gray(),
         format!(" {} ", app.route().label()).dim(),
         "/home ".bold().cyan(),
-        "/about ".bold().cyan(),
-        "/settings ".bold().cyan(),
         "ESC ".bold().magenta(),
         "quit".dim(),
     ]))

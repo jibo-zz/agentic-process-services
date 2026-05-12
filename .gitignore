@@ -1,1 +1,14 @@
 target/
+
+# Environment files (any directory)
+**/.env
+**/.env.local
+**/.env.*.local
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.iml

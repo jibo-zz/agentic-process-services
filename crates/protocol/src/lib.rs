@@ -4,6 +4,25 @@ use serde::{Deserialize, Serialize};
 
 pub const RPC_PATH: &str = "/rpc";
 pub const RPC_HEALTH_CHECK: &str = "health.check";
+pub const RPC_LLM_GENERATE: &str = "llm.generate";
+pub const CHAT_STREAM_PATH: &str = "/chat/stream";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,   // "user" or "assistant"
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatRequest {
+    pub messages: Vec<ChatMessage>,  // full history; last entry must be the new user message
+}
+pub const LLM_PREAMBLE: &str = "You are usful assistance.";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmChunk {
+    pub text: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
@@ -16,6 +35,19 @@ impl HealthResponse {
         Self {
             status: "ok".to_owned(),
             service: service.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmResponse {
+    pub output: String,
+}
+
+impl LlmResponse {
+    pub fn new(output: impl Into<String>) -> Self {
+        Self {
+            output: output.into(),
         }
     }
 }
@@ -88,6 +120,13 @@ impl RpcError {
         Self {
             code: -32601,
             message: format!("method not found: {}", method.into()),
+        }
+    }
+
+    pub fn internal_error(error: impl Into<String>) -> Self {
+        Self {
+            code: -32603,
+            message: error.into(),
         }
     }
 }

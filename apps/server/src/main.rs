@@ -3,6 +3,9 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let _ = dotenvy::from_path(manifest_dir.join(".env"));
+
     // Initialize logging once at startup; RUST_LOG can override the default.
     tracing_subscriber::fmt()
         .with_env_filter(
