@@ -1,6 +1,4 @@
 use agentic_config::ServerConfig;
-use agentic_protocol::HealthResponse;
-use axum::{Json, Router, routing::get};
 use tracing::info;
 
 #[tokio::main]
@@ -13,8 +11,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    // Keep the HTTP surface minimal until shared app logic is extracted.
-    let app = Router::new().route("/health", get(health));
+    let app = server::app();
     let config = ServerConfig::from_env()?;
     let listener = tokio::net::TcpListener::bind(config.addr).await?;
 
@@ -25,10 +22,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     Ok(())
-}
-
-async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse::ok(agentic_core::SERVICE_NAME))
 }
 
 async fn shutdown_signal() {

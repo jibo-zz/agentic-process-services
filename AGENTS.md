@@ -26,6 +26,9 @@
 - Run the server on another address: `APS_SERVER_ADDR=127.0.0.1:4000 cargo run -p server`.
 - Run the TUI: `cargo run -p cli`; it takes over the terminal alternate screen and exits on `Esc` or `Ctrl+C`.
 
+## Git
+- Match the latest commit subject format for new commits: a short, imperative, title-cased one-line summary with no trailing period, like `Build agent-style CLI home screen`.
+
 ## Runtime Notes
 - Server logging uses `tracing_subscriber` with `RUST_LOG` support and defaults to `server=info`.
 - The server returns shared protocol DTOs from `agentic-protocol`; keep API response structs there if the CLI will consume them later.

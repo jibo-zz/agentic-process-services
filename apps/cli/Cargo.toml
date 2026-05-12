@@ -9,6 +9,10 @@ license.workspace = true
 [dependencies]
 # Versions are inherited from the workspace root to keep app dependencies aligned.
 agentic-core.workspace = true
+agentic-config.workspace = true
+agentic-protocol.workspace = true
 color-eyre.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
+reqwest.workspace = true
+tokio.workspace = true

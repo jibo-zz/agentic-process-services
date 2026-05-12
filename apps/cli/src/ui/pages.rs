@@ -1,4 +1,4 @@
-use crate::app::App;
+use crate::app::{App, ServerHealth};
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Constraint, Flex, Layout, Rect},
@@ -22,11 +22,20 @@ impl<'a> AboutPage<'a> {
 
 impl Widget for AboutPage<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let health = match self.app.server_health() {
+            ServerHealth::Unknown => "Server: checking...".to_owned(),
+            ServerHealth::Up { service, status } => {
+                format!("Server: UP - {service} reports {status}")
+            }
+            ServerHealth::Down(error) => format!("Server: DOWN - {error}"),
+            ServerHealth::Error(error) => format!("Server: ERROR - {error}"),
+        };
+
         PageShell::new(
             self.app,
             "About",
             "Faaido is an agentic process workspace.",
-            "Use slash commands to move between pages while the CLI grows into a full session UI.",
+            &health,
         )
         .render(area, buf);
     }

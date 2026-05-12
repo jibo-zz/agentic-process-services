@@ -8,6 +8,9 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{io, panic};
 
+use crate::app::Route;
+use cli::client::{FetchError, Fetcher};
+
 pub fn run() -> Result<()> {
     let mut terminal = init_terminal()?;
     let result = run_app(&mut terminal);
@@ -18,9 +21,9 @@ pub fn run() -> Result<()> {
 
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::default();
+    let fetcher = Fetcher::local();
+    let runtime = tokio::runtime::Runtime::new()?;
 
-    // A simple event loop is enough for this home screen; async can be added
-    // later if the CLI needs background work or server communication.
     loop {
         terminal.draw(|frame| ui::render(frame, &app))?;
 
@@ -30,9 +33,23 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
         {
             break;
         }
+
+        refresh_about_health(&mut app, &fetcher, &runtime);
     }
 
     Ok(())
+}
+
+fn refresh_about_health(app: &mut App, fetcher: &Fetcher, runtime: &tokio::runtime::Runtime) {
+    if !matches!(app.route(), Route::About) || !app.server_health().is_unknown() {
+        return;
+    }
+
+    match runtime.block_on(fetcher.check_health()) {
+        Ok(health) => app.set_server_up(health.service, health.status),
+        Err(FetchError::Http(error)) => app.set_server_down(error.to_string()),
+        Err(error) => app.set_server_error(error.to_string()),
+    }
 }
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {

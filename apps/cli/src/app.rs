@@ -48,6 +48,24 @@ impl SessionMessage {
     }
 }
 
+#[derive(Default)]
+pub enum ServerHealth {
+    #[default]
+    Unknown,
+    Up {
+        service: String,
+        status: String,
+    },
+    Down(String),
+    Error(String),
+}
+
+impl ServerHealth {
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum TextAreaAction {
     Submit,
@@ -110,6 +128,7 @@ pub struct App {
     route: Route,
     input: String,
     messages: Vec<SessionMessage>,
+    server_health: ServerHealth,
 }
 
 impl App {
@@ -127,6 +146,29 @@ impl App {
 
     pub fn messages(&self) -> &[SessionMessage] {
         &self.messages
+    }
+
+    pub fn server_health(&self) -> &ServerHealth {
+        &self.server_health
+    }
+
+    pub fn reset_server_health(&mut self) {
+        self.server_health = ServerHealth::Unknown;
+    }
+
+    pub fn set_server_up(&mut self, service: impl Into<String>, status: impl Into<String>) {
+        self.server_health = ServerHealth::Up {
+            service: service.into(),
+            status: status.into(),
+        };
+    }
+
+    pub fn set_server_down(&mut self, error: impl Into<String>) {
+        self.server_health = ServerHealth::Down(error.into());
+    }
+
+    pub fn set_server_error(&mut self, error: impl Into<String>) {
+        self.server_health = ServerHealth::Error(error.into());
     }
 
     pub fn text_area_key_bindings_hint(&self) -> String {
@@ -202,7 +244,10 @@ impl App {
 
         match normalized.as_str() {
             "home" => self.route = Route::Home,
-            "about" => self.route = Route::About,
+            "about" => {
+                self.route = Route::About;
+                self.reset_server_health();
+            }
             "settings" => self.route = Route::Settings,
             _ => self.route = Route::Missing(format!("/{command}")),
         }
