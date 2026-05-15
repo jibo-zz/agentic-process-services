@@ -2490,6 +2490,7 @@ dependencies = [
  "axum",
  "dotenvy",
  "futures-util",
+ "reqwest 0.12.28",
  "rig-core",
  "serde",
  "serde_json",

@@ -13,17 +13,26 @@
 - `Enter` submits the textarea; `Ctrl+Enter` / `Alt+Enter` insert newlines. Keybindings are declared explicitly in `app.rs`.
 - Move any code shared between `apps/server` and `apps/cli` into a `crates/` library.
 - `apps/cli/src/client.rs` exposes typed wrapper methods (`check_health()`, `chat_stream()`). Raw RPC construction stays private to the client layer. RPC constants and DTOs belong in `agentic-protocol`.
+- Server tool implementations stay server-only (`apps/server/src/tools.rs`); CLI renders generic `ChatStreamEvent`/`UiPart` data and must not depend on Rig, Open-Meteo, or provider-specific tool types.
 
 ## Streaming
 - JSON-RPC can't stream (one request, one response) — use a dedicated SSE endpoint instead. Path constant and chunk DTO live in `agentic-protocol`; SSE wire-format parsing stays inside the client wrapper.
 - The streaming endpoint is `POST /chat/stream` with a `ChatRequest { messages }` JSON body (not GET + query param) because conversation history must travel in the request body.
+- `/chat/stream` emits `ChatStreamEvent` SSE payloads, not raw text chunks, so reasoning, text, tool updates, and non-terminal errors can render in-place in the TUI.
 - The TUI event loop uses `event::poll(50ms)` + `std::sync::mpsc`; spawn tokio tasks via `runtime.spawn()`, drain with `try_recv()` before `terminal.draw()`.
 - Guard task spawn with `app.chat_stream().is_pending()` to prevent double-spawning. Set `chat_rx = None` when navigating away — the spawned task exits naturally when its sender errors.
+- Tool updates are upserted by tool-call id while text/reasoning deltas append to the last matching part; this avoids tool-block flicker and preserves scroll stability.
 
 ## Session Persistence
 - Sessions are stored as JSON in `~/.faaido/sessions/<id>.json`. The `id` is a zero-padded 16-digit hex Unix timestamp in milliseconds.
-- `Session::to_chat_messages(new_user_msg)` is the only correct way to build the history slice for `POST /chat/stream`; it interleaves completed turns then appends the optional new user message.
+- Sessions persist rich `UiMessage { role, parts }` history, but `Session::to_chat_messages(new_user_msg)` intentionally sends only user/assistant text parts to the model; reasoning, tool state, and UI errors are persisted for display only.
+- Old/unreadable session JSON is ignored during `load_all()`; loading sessions must remain read-only and must not rename or delete user files.
 - Esc on the Sessions screen navigates to `Route::Home`, not quit.
+
+## Tools
+- `get_current_weather` is a single Rig tool that internally geocodes and fetches weather via Open-Meteo to keep the agent loop short; Celsius is the default unless the user explicitly asks for Fahrenheit.
+- Rig 0.36 agent streams expose completed tool calls/results and reasoning/text events; tool-call delta UI is still covered by `debug:tool-stream` because the public agent stream path may not yield deltas without hooks.
+- `debug:tool-stream` is an exact prompt trigger for testing reasoning, tool states, non-terminal errors, and final text over the real SSE/client path without spending model credits.
 
 ## Environment
 - The server loads `apps/server/.env` via `dotenvy::from_path(Path::new(env!("CARGO_MANIFEST_DIR")).join(".env"))` — works regardless of the working directory `cargo run` is invoked from.

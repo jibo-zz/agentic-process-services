@@ -1,4 +1,5 @@
 use crate::sessions::{self, Session};
+use agentic_protocol::{ChatStreamEvent, ToolState, UiMessage, UiPart, UiRole};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Clone, Default, Eq, PartialEq)]
@@ -25,8 +26,11 @@ impl Route {
 pub enum ChatStream {
     #[default]
     Idle,
-    Pending(String),                                  // user message, not yet sent
-    Streaming { user_msg: String, response: String }, // live turn
+    Pending(String), // user message, not yet sent
+    Streaming {
+        user_msg: String,
+        assistant: UiMessage,
+    }, // live turn
 }
 
 impl ChatStream {
@@ -35,7 +39,11 @@ impl ChatStream {
     }
 
     pub fn pending_prompt(&self) -> Option<&str> {
-        if let Self::Pending(p) = self { Some(p) } else { None }
+        if let Self::Pending(p) = self {
+            Some(p)
+        } else {
+            None
+        }
     }
 }
 
@@ -69,10 +77,30 @@ impl TextAreaKeyBinding {
 }
 
 const TEXTAREA_KEY_BINDINGS: &[TextAreaKeyBinding] = &[
-    TextAreaKeyBinding { name: "return", code: KeyCode::Enter, modifiers: KeyModifiers::NONE, action: TextAreaAction::Submit },
-    TextAreaKeyBinding { name: "return", code: KeyCode::Enter, modifiers: KeyModifiers::CONTROL, action: TextAreaAction::InsertNewline },
-    TextAreaKeyBinding { name: "return", code: KeyCode::Enter, modifiers: KeyModifiers::ALT, action: TextAreaAction::InsertNewline },
-    TextAreaKeyBinding { name: "backspace", code: KeyCode::Backspace, modifiers: KeyModifiers::NONE, action: TextAreaAction::Backspace },
+    TextAreaKeyBinding {
+        name: "return",
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::NONE,
+        action: TextAreaAction::Submit,
+    },
+    TextAreaKeyBinding {
+        name: "return",
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::CONTROL,
+        action: TextAreaAction::InsertNewline,
+    },
+    TextAreaKeyBinding {
+        name: "return",
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::ALT,
+        action: TextAreaAction::InsertNewline,
+    },
+    TextAreaKeyBinding {
+        name: "backspace",
+        code: KeyCode::Backspace,
+        modifiers: KeyModifiers::NONE,
+        action: TextAreaAction::Backspace,
+    },
 ];
 
 #[derive(Default)]
@@ -90,35 +118,82 @@ pub struct App {
 }
 
 impl App {
-    pub fn route(&self) -> &Route { &self.route }
-    pub fn input(&self) -> &str { &self.input }
-    pub fn input_len(&self) -> usize { self.input.len() }
-    pub fn chat_stream(&self) -> &ChatStream { &self.chat_stream }
-    pub fn chat_scroll(&self) -> u16 { self.chat_scroll }
-    pub fn set_chat_scroll(&mut self, v: u16) { self.chat_scroll = v; }
-    pub fn scroll_chat_up(&mut self) { self.chat_scroll = self.chat_scroll.saturating_sub(1); }
-    pub fn scroll_chat_down(&mut self) { self.chat_scroll = self.chat_scroll.saturating_add(1); }
-    pub fn scroll_chat_to_bottom(&mut self) { self.chat_scroll = u16::MAX; }
+    pub fn route(&self) -> &Route {
+        &self.route
+    }
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+    pub fn input_len(&self) -> usize {
+        self.input.len()
+    }
+    pub fn chat_stream(&self) -> &ChatStream {
+        &self.chat_stream
+    }
+    pub fn chat_scroll(&self) -> u16 {
+        self.chat_scroll
+    }
+    pub fn set_chat_scroll(&mut self, v: u16) {
+        self.chat_scroll = v;
+    }
+    pub fn scroll_chat_up(&mut self) {
+        self.chat_scroll = self.chat_scroll.saturating_sub(1);
+    }
+    pub fn scroll_chat_down(&mut self) {
+        self.chat_scroll = self.chat_scroll.saturating_add(1);
+    }
+    pub fn scroll_chat_to_bottom(&mut self) {
+        self.chat_scroll = u16::MAX;
+    }
 
     /// Called by tui.rs when it picks up the Pending state and spawns the task.
     pub fn start_chat_stream(&mut self) {
         if let ChatStream::Pending(user_msg) = std::mem::take(&mut self.chat_stream) {
-            self.chat_stream = ChatStream::Streaming { user_msg, response: String::new() };
+            self.chat_stream = ChatStream::Streaming {
+                user_msg,
+                assistant: UiMessage::assistant(),
+            };
         }
     }
 
-    pub fn append_chat_chunk(&mut self, text: &str) {
-        if let ChatStream::Streaming { response, .. } = &mut self.chat_stream {
-            response.push_str(text);
+    pub fn apply_chat_stream_event(&mut self, event: ChatStreamEvent) {
+        let ChatStream::Streaming { assistant, .. } = &mut self.chat_stream else {
+            return;
+        };
+
+        match event {
+            ChatStreamEvent::MessageStart { role } => {
+                if role == UiRole::Assistant && assistant.role != UiRole::Assistant {
+                    assistant.role = UiRole::Assistant;
+                }
+            }
+            ChatStreamEvent::TextDelta { text } => append_text_part(assistant, text),
+            ChatStreamEvent::ReasoningDelta { text } => append_reasoning_part(assistant, text),
+            ChatStreamEvent::ToolUpdate {
+                id,
+                name,
+                state,
+                input,
+                output,
+                error,
+            } => {
+                upsert_tool_part(assistant, id, name, state, input, output, error);
+            }
+            ChatStreamEvent::Error { message } => assistant.parts.push(UiPart::Error { message }),
+            ChatStreamEvent::MessageDone => {}
         }
     }
 
     /// Saves the completed turn into the session and persists to disk.
     pub fn finish_chat_stream(&mut self) {
-        if let ChatStream::Streaming { user_msg, response } = std::mem::take(&mut self.chat_stream)
+        if let ChatStream::Streaming {
+            user_msg,
+            assistant,
+        } = std::mem::take(&mut self.chat_stream)
             && let Some(session) = &mut self.active_session
         {
-            session.turns.push(sessions::Turn { user: user_msg, assistant: response });
+            session.messages.push(UiMessage::user_text(user_msg));
+            session.messages.push(assistant);
             sessions::save(session);
         }
     }
@@ -126,14 +201,19 @@ impl App {
     pub fn set_chat_error(&mut self, error: impl Into<String>) {
         let msg = error.into();
         if let Some(session) = &mut self.active_session {
-            let user_msg = match std::mem::take(&mut self.chat_stream) {
-                ChatStream::Streaming { user_msg, .. } => user_msg,
-                _ => String::new(),
+            let (user_msg, mut assistant) = match std::mem::take(&mut self.chat_stream) {
+                ChatStream::Streaming {
+                    user_msg,
+                    assistant,
+                } => (user_msg, assistant),
+                ChatStream::Pending(user_msg) => (user_msg, UiMessage::assistant()),
+                ChatStream::Idle => (String::new(), UiMessage::assistant()),
             };
-            session.turns.push(sessions::Turn {
-                user: user_msg,
-                assistant: format!("Error: {msg}"),
-            });
+            assistant.parts.push(UiPart::Error { message: msg });
+            if !user_msg.is_empty() {
+                session.messages.push(UiMessage::user_text(user_msg));
+            }
+            session.messages.push(assistant);
             sessions::save(session);
         }
         self.chat_stream = ChatStream::Idle;
@@ -171,13 +251,22 @@ impl App {
             }
 
             // Chat scroll
-            KeyCode::Up if matches!(self.route, Route::Chat) => { self.scroll_chat_up(); false }
-            KeyCode::Down if matches!(self.route, Route::Chat) => { self.scroll_chat_down(); false }
+            KeyCode::Up if matches!(self.route, Route::Chat) => {
+                self.scroll_chat_up();
+                false
+            }
+            KeyCode::Down if matches!(self.route, Route::Chat) => {
+                self.scroll_chat_down();
+                false
+            }
 
             // Text input (only on routes that have an input box)
             _ if matches!(self.route, Route::Sessions) => false,
             _ if self.handle_text_area_key(key) => false,
-            KeyCode::Char(c) => { self.input.push(c); false }
+            KeyCode::Char(c) => {
+                self.input.push(c);
+                false
+            }
             _ => false,
         }
     }
@@ -189,14 +278,18 @@ impl App {
         match binding.action {
             TextAreaAction::Submit => self.submit_prompt(),
             TextAreaAction::InsertNewline => self.input.push('\n'),
-            TextAreaAction::Backspace => { self.input.pop(); }
+            TextAreaAction::Backspace => {
+                self.input.pop();
+            }
         }
         true
     }
 
     fn submit_prompt(&mut self) {
         let prompt = self.input.trim().to_owned();
-        if prompt.is_empty() { return; }
+        if prompt.is_empty() {
+            return;
+        }
 
         if self.handle_route_command(&prompt) {
             self.input.clear();
@@ -204,7 +297,10 @@ impl App {
         }
 
         // Ignore submissions while a stream is active
-        if matches!(self.chat_stream, ChatStream::Streaming { .. } | ChatStream::Pending(_)) {
+        if matches!(
+            self.chat_stream,
+            ChatStream::Streaming { .. } | ChatStream::Pending(_)
+        ) {
             self.input.clear();
             return;
         }
@@ -227,7 +323,9 @@ impl App {
     }
 
     fn handle_route_command(&mut self, prompt: &str) -> bool {
-        let Some(command) = prompt.strip_prefix('/') else { return false; };
+        let Some(command) = prompt.strip_prefix('/') else {
+            return false;
+        };
         let normalized = command.trim_end_matches('/').to_ascii_lowercase();
         match normalized.as_str() {
             "home" => self.route = Route::Home,
@@ -251,6 +349,67 @@ impl App {
         self.chat_scroll = u16::MAX;
         self.route = Route::Chat;
     }
+}
+
+fn append_text_part(message: &mut UiMessage, text: String) {
+    match message.parts.last_mut() {
+        Some(UiPart::Text { content }) => content.push_str(&text),
+        _ => message.parts.push(UiPart::Text { content: text }),
+    }
+}
+
+fn append_reasoning_part(message: &mut UiMessage, text: String) {
+    match message.parts.last_mut() {
+        Some(UiPart::Reasoning { content }) => content.push_str(&text),
+        _ => message.parts.push(UiPart::Reasoning { content: text }),
+    }
+}
+
+fn upsert_tool_part(
+    message: &mut UiMessage,
+    id: String,
+    name: String,
+    state: ToolState,
+    input: Option<serde_json::Value>,
+    output: Option<serde_json::Value>,
+    error: Option<String>,
+) {
+    if let Some(UiPart::Tool {
+        name: existing_name,
+        state: existing_state,
+        input: existing_input,
+        output: existing_output,
+        error: existing_error,
+        ..
+    }) = message
+        .parts
+        .iter_mut()
+        .find(|part| matches!(part, UiPart::Tool { id: existing_id, .. } if existing_id == &id))
+    {
+        if !name.is_empty() {
+            *existing_name = name;
+        }
+        *existing_state = state;
+        if input.is_some() {
+            *existing_input = input;
+        }
+        if output.is_some() {
+            *existing_output = output;
+        }
+        if error.is_some() {
+            *existing_error = error;
+        }
+        return;
+    }
+
+    message.parts.push(UiPart::Tool {
+        id,
+        name,
+        state,
+        input,
+        output,
+        error,
+    });
 }
 
 fn key_binding_names(action: TextAreaAction) -> Vec<String> {

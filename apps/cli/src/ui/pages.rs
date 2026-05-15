@@ -70,10 +70,7 @@ impl Widget for PageShell<'_> {
             Line::from(self.summary.dim()),
             Line::from(self.detail.dark_gray()),
             Line::from(""),
-            Line::from(vec![
-                "Commands".bold().green(),
-                "  /home  /sessions".dim(),
-            ]),
+            Line::from(vec!["Commands".bold().green(), "  /home  /sessions".dim()]),
         ]);
 
         Paragraph::new(text)

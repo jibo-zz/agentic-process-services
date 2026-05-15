@@ -1,6 +1,7 @@
 //! Shared API DTOs for server responses and future CLI clients.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub const RPC_PATH: &str = "/rpc";
 pub const RPC_HEALTH_CHECK: &str = "health.check";
@@ -9,15 +10,110 @@ pub const CHAT_STREAM_PATH: &str = "/chat/stream";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
-    pub role: String,   // "user" or "assistant"
+    pub role: String, // "user" or "assistant"
     pub content: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
-    pub messages: Vec<ChatMessage>,  // full history; last entry must be the new user message
+    pub messages: Vec<ChatMessage>, // full history; last entry must be the new user message
 }
 pub const LLM_PREAMBLE: &str = "You are usful assistance.";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiMessage {
+    pub role: UiRole,
+    pub parts: Vec<UiPart>,
+}
+
+impl UiMessage {
+    pub fn user_text(content: impl Into<String>) -> Self {
+        Self {
+            role: UiRole::User,
+            parts: vec![UiPart::Text {
+                content: content.into(),
+            }],
+        }
+    }
+
+    pub fn assistant() -> Self {
+        Self {
+            role: UiRole::Assistant,
+            parts: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiRole {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UiPart {
+    Text {
+        content: String,
+    },
+    Reasoning {
+        content: String,
+    },
+    Tool {
+        id: String,
+        name: String,
+        state: ToolState,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    Error {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolState {
+    Streaming,
+    Calling,
+    AwaitingApproval,
+    Complete,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatStreamEvent {
+    MessageStart {
+        role: UiRole,
+    },
+    TextDelta {
+        text: String,
+    },
+    ReasoningDelta {
+        text: String,
+    },
+    ToolUpdate {
+        id: String,
+        name: String,
+        state: ToolState,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    Error {
+        message: String,
+    },
+    MessageDone,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmChunk {

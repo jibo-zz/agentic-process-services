@@ -10,10 +10,11 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{io, panic, sync::mpsc, time::Duration};
 
 use crate::app::Route;
+use agentic_protocol::ChatStreamEvent;
 use cli::client::Fetcher;
 
 enum ChatEvent {
-    Chunk(String),
+    Stream(ChatStreamEvent),
     Done,
     Err(String),
 }
@@ -48,13 +49,21 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
             let f = fetcher.clone();
             runtime.spawn(async move {
                 match f.chat_stream(&messages).await {
-                    Err(e) => { let _ = tx.send(ChatEvent::Err(e.to_string())); }
+                    Err(e) => {
+                        let _ = tx.send(ChatEvent::Err(e.to_string()));
+                    }
                     Ok(stream) => {
                         tokio::pin!(stream);
                         while let Some(item) = stream.next().await {
                             match item {
                                 Ok(chunk) => {
-                                    if tx.send(ChatEvent::Chunk(chunk.text)).is_err() { return; }
+                                    let is_done = matches!(chunk, ChatStreamEvent::MessageDone);
+                                    if tx.send(ChatEvent::Stream(chunk)).is_err() {
+                                        return;
+                                    }
+                                    if is_done {
+                                        return;
+                                    }
                                 }
                                 Err(e) => {
                                     let _ = tx.send(ChatEvent::Err(e.to_string()));
@@ -72,9 +81,16 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
         if let Some(ref rx) = chat_rx {
             while let Ok(event) = rx.try_recv() {
                 match event {
-                    ChatEvent::Chunk(text) => {
-                        app.append_chat_chunk(&text);
+                    ChatEvent::Stream(event) => {
+                        let is_done = matches!(event, ChatStreamEvent::MessageDone);
+                        app.apply_chat_stream_event(event);
                         app.scroll_chat_to_bottom();
+                        if is_done {
+                            app.finish_chat_stream();
+                            app.scroll_chat_to_bottom();
+                            chat_rx = None;
+                            break;
+                        }
                     }
                     ChatEvent::Done => {
                         app.finish_chat_stream();
@@ -99,8 +115,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                     break;
                 }
                 Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp if matches!(app.route, Route::Chat) => app.scroll_chat_up(),
-                    MouseEventKind::ScrollDown if matches!(app.route, Route::Chat) => app.scroll_chat_down(),
+                    MouseEventKind::ScrollUp if matches!(app.route, Route::Chat) => {
+                        app.scroll_chat_up()
+                    }
+                    MouseEventKind::ScrollDown if matches!(app.route, Route::Chat) => {
+                        app.scroll_chat_down()
+                    }
                     _ => {}
                 },
                 _ => {}
@@ -123,7 +143,11 @@ fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
 
 fn restore_terminal() -> Result<()> {
     disable_raw_mode()?;
-    execute!(io::stdout(), event::DisableMouseCapture, LeaveAlternateScreen)?;
+    execute!(
+        io::stdout(),
+        event::DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     Ok(())
 }
 

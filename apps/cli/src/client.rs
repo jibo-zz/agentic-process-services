@@ -1,7 +1,7 @@
 use agentic_config::DEFAULT_SERVER_ADDR;
 use agentic_protocol::{
-    ChatMessage, HealthResponse, LlmChunk, LlmResponse,
-    RPC_HEALTH_CHECK, RPC_LLM_GENERATE, RPC_PATH, RpcError, RpcRequest, RpcResponse,
+    ChatMessage, ChatStreamEvent, HealthResponse, LlmResponse, RPC_HEALTH_CHECK, RPC_LLM_GENERATE,
+    RPC_PATH, RpcError, RpcRequest, RpcResponse,
 };
 use futures_util::{Stream, StreamExt, stream};
 use serde::de::DeserializeOwned;
@@ -77,13 +77,15 @@ impl Fetcher {
     pub async fn chat_stream(
         &self,
         messages: &[ChatMessage],
-    ) -> Result<impl Stream<Item = Result<LlmChunk, FetchError>>, FetchError> {
+    ) -> Result<impl Stream<Item = Result<ChatStreamEvent, FetchError>>, FetchError> {
         use agentic_protocol::{CHAT_STREAM_PATH, ChatRequest};
 
         let response = self
             .http
             .post(format!("{}{CHAT_STREAM_PATH}", self.base_url))
-            .json(&ChatRequest { messages: messages.to_vec() })
+            .json(&ChatRequest {
+                messages: messages.to_vec(),
+            })
             .send()
             .await?
             .error_for_status()?;
@@ -99,14 +101,14 @@ impl Fetcher {
                         buf.drain(..pos + 2);
                         for line in event.lines() {
                             if let Some(json) = line.strip_prefix("data: ") {
-                                match serde_json::from_str::<LlmChunk>(json) {
-                                    Ok(chunk) if !chunk.text.is_empty() => {
-                                        return Some((Ok(chunk), (bytes_stream, buf)));
-                                    }
+                                match serde_json::from_str::<ChatStreamEvent>(json) {
+                                    Ok(event) => return Some((Ok(event), (bytes_stream, buf))),
                                     Err(e) => {
-                                        return Some((Err(FetchError::Decode(e.to_string())), (bytes_stream, buf)));
+                                        return Some((
+                                            Err(FetchError::Decode(e.to_string())),
+                                            (bytes_stream, buf),
+                                        ));
                                     }
-                                    _ => {}
                                 }
                             }
                         }
@@ -114,7 +116,9 @@ impl Fetcher {
                     }
                     match bytes_stream.next().await {
                         None => return None,
-                        Some(Err(e)) => return Some((Err(FetchError::Http(e)), (bytes_stream, buf))),
+                        Some(Err(e)) => {
+                            return Some((Err(FetchError::Http(e)), (bytes_stream, buf)));
+                        }
                         Some(Ok(bytes)) => buf.push_str(&String::from_utf8_lossy(&bytes)),
                     }
                 }

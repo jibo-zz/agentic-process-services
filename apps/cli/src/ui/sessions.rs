@@ -22,12 +22,9 @@ impl Widget for SessionsScreen<'_> {
         Paragraph::new("").style(Style::new()).render(area, buf);
 
         let page = centered_rect(area, 92, area.height.saturating_sub(2).max(10));
-        let [list_area, footer] = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Length(1),
-        ])
-        .spacing(1)
-        .areas(page);
+        let [list_area, footer] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)])
+            .spacing(1)
+            .areas(page);
 
         render_list(self.app, list_area, buf);
         render_footer(footer, buf);
@@ -49,7 +46,9 @@ fn render_list(app: &App, area: Rect, buf: &mut Buffer) {
     let mut lines = vec![];
 
     if sessions.is_empty() {
-        lines.push(Line::from("No sessions yet. Start a conversation from the home screen.".dim()));
+        lines.push(Line::from(
+            "No sessions yet. Start a conversation from the home screen.".dim(),
+        ));
     } else {
         for (i, session) in sessions.iter().enumerate().skip(scroll).take(inner_height) {
             let is_selected = i == cursor;
@@ -60,14 +59,18 @@ fn render_list(app: &App, area: Rect, buf: &mut Buffer) {
             } else {
                 session.title.clone()
             };
-            let turns = format!("{} turn{}", session.turns.len(), if session.turns.len() == 1 { "" } else { "s" });
+            let messages = format!(
+                "{} msg{}",
+                session.messages.len(),
+                if session.messages.len() == 1 { "" } else { "s" }
+            );
 
             if is_selected {
                 lines.push(Line::from(vec![
                     Span::styled("  ▶ ", Style::new().cyan().bold()),
                     Span::styled(title, Style::new().white().bold()),
                     Span::raw("  "),
-                    Span::styled(turns, Style::new().dark_gray()),
+                    Span::styled(messages, Style::new().dark_gray()),
                     Span::raw("  "),
                     Span::styled(date, Style::new().dim()),
                 ]));
@@ -76,7 +79,7 @@ fn render_list(app: &App, area: Rect, buf: &mut Buffer) {
                     Span::raw("    "),
                     Span::styled(title, Style::new().dim()),
                     Span::raw("  "),
-                    Span::styled(turns, Style::new().dark_gray()),
+                    Span::styled(messages, Style::new().dark_gray()),
                     Span::raw("  "),
                     Span::styled(date, Style::new().dark_gray()),
                 ]));
