@@ -1,11 +1,16 @@
 mod tools;
 
+use agentic_db::{
+    repo::{messages, sessions},
+};
 use agentic_protocol::{
     CHAT_STREAM_PATH, ChatRequest, ChatStreamEvent, HealthResponse, LLM_PREAMBLE, RPC_HEALTH_CHECK,
-    RPC_PATH, RpcError, RpcRequest, RpcResponse, ToolState, UiRole,
+    RPC_PATH, RPC_SESSIONS_GET, RPC_SESSIONS_LIST, RpcError, RpcRequest, RpcResponse,
+    ToolState, UiMessage, UiRole,
 };
 use axum::{
     Json, Router,
+    extract::State,
     http::StatusCode,
     response::{
         IntoResponse,
@@ -30,15 +35,24 @@ use rig::{
         StreamedAssistantContent, StreamedUserContent, StreamingPrompt, ToolCallDeltaContent,
     },
 };
-use std::{convert::Infallible, time::Duration};
+use agentic_db::DatabaseConnection;
+use std::{convert::Infallible, sync::Arc, time::Duration};
+use tokio::sync::mpsc;
 
 pub type AppType = Router;
 
-pub fn app() -> AppType {
+#[derive(Clone)]
+pub struct AppState {
+    pub db: DatabaseConnection,
+}
+
+pub fn app(db: DatabaseConnection) -> AppType {
+    let state = Arc::new(AppState { db });
     Router::new()
         .route("/health", get(health))
         .route(CHAT_STREAM_PATH, post(chat_stream))
         .route(RPC_PATH, post(rpc))
+        .with_state(state)
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -46,30 +60,41 @@ async fn health() -> Json<HealthResponse> {
 }
 
 async fn chat_stream(
+    State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if req.messages.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "messages must not be empty".to_owned(),
-        ));
-    }
-    let last = req.messages.last().unwrap();
-    if last.role != "user" {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "last message role must be 'user'".to_owned(),
-        ));
+    if req.message.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "message must not be empty".to_owned()));
     }
 
-    let prompt = last.content.clone();
-    if prompt == "debug:tool-stream" {
+    if req.message == "debug:tool-stream" {
         return Ok(Sse::new(debug_tool_stream()).keep_alive(KeepAlive::default()));
     }
 
-    let prior = &req.messages[..req.messages.len() - 1];
+    let session_id = req.session_id.clone();
+    let prompt = req.message.clone();
+    let title = prompt.chars().take(60).collect::<String>();
 
-    let prior_rig_messages: Vec<RigMessage> = prior
+    // Upsert session, count prior messages, load LLM history — all before inserting user turn
+    sessions::upsert(&state.db, &session_id, &title)
+        .await
+        .map_err(|e| internal_error(e))?;
+
+    let user_position = messages::count(&state.db, &session_id)
+        .await
+        .map_err(|e| internal_error(e))?;
+
+    let prior_chat_messages = sessions::load_history(&state.db, &session_id)
+        .await
+        .map_err(|e| internal_error(e))?;
+
+    // Insert user message
+    let user_msg = UiMessage::user_text(&prompt);
+    messages::insert(&state.db, &session_id, user_position, &user_msg)
+        .await
+        .map_err(|e| internal_error(e))?;
+
+    let prior_rig_messages: Vec<RigMessage> = prior_chat_messages
         .iter()
         .map(|msg| {
             if msg.role == "assistant" {
@@ -99,68 +124,91 @@ async fn chat_stream(
         .tool(tools::CurrentWeatherTool)
         .build();
 
-    let stream = agent
+    let agent_stream = agent
         .stream_prompt(&prompt)
         .with_history(prior_rig_messages)
         .await
-        .filter_map(|item| async move { stream_item_event(item) })
+        .filter_map(|item| async move { stream_item_to_chat_event(item) })
         .then(|event| async move {
             tokio::time::sleep(Duration::from_millis(40)).await;
             event
         });
 
-    let stream = stream::iter([stream_event(ChatStreamEvent::MessageStart {
-        role: UiRole::Assistant,
-    })])
-    .chain(stream)
-    .chain(stream::iter([stream_event(ChatStreamEvent::MessageDone)]))
-    .boxed();
+    let full_stream: BoxStream<ChatStreamEvent> =
+        stream::iter([ChatStreamEvent::MessageStart { role: UiRole::Assistant }])
+            .chain(agent_stream)
+            .chain(stream::iter([ChatStreamEvent::MessageDone]))
+            .boxed();
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    // Side-channel: accumulate assistant message and persist on MessageDone
+    let (persist_tx, mut persist_rx) = mpsc::unbounded_channel::<ChatStreamEvent>();
+    let state_clone = state.clone();
+    let session_id_clone = session_id.clone();
+    let assistant_position = user_position + 1;
+
+    tokio::spawn(async move {
+        let mut assistant_msg = UiMessage::assistant();
+        while let Some(event) = persist_rx.recv().await {
+            if matches!(event, ChatStreamEvent::MessageDone) {
+                let db = &state_clone.db;
+                let _ = sessions::touch_updated_at(db, &session_id_clone).await;
+                let _ = messages::insert(db, &session_id_clone, assistant_position, &assistant_msg).await;
+                break;
+            }
+            assistant_msg.apply_stream_event(&event);
+        }
+    });
+
+    let sse_stream: BoxStream<Result<Event, Infallible>> = full_stream
+        .inspect(move |event| {
+            let _ = persist_tx.send(event.clone());
+        })
+        .map(stream_event)
+        .boxed();
+
+    Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
 }
 
-fn stream_item_event<R>(
+fn stream_item_to_chat_event<R>(
     item: Result<MultiTurnStreamItem<R>, impl std::fmt::Display>,
-) -> Option<Result<Event, Infallible>> {
+) -> Option<ChatStreamEvent> {
     match item {
-        Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => assistant_content_event(content),
+        Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => assistant_content_to_chat_event(content),
         Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
             tool_result,
             ..
-        })) => Some(stream_event(tool_result_event(tool_result))),
+        })) => Some(tool_result_event(tool_result)),
         Ok(MultiTurnStreamItem::FinalResponse(_)) => None,
         Ok(_) => None,
-        Err(error) => Some(stream_event(ChatStreamEvent::Error {
+        Err(error) => Some(ChatStreamEvent::Error {
             message: error.to_string(),
-        })),
+        }),
     }
 }
 
-fn assistant_content_event<R>(
+fn assistant_content_to_chat_event<R>(
     content: StreamedAssistantContent<R>,
-) -> Option<Result<Event, Infallible>> {
+) -> Option<ChatStreamEvent> {
     match content {
         StreamedAssistantContent::Text(text) if !text.text.is_empty() => {
-            Some(stream_event(ChatStreamEvent::TextDelta { text: text.text }))
+            Some(ChatStreamEvent::TextDelta { text: text.text })
         }
         StreamedAssistantContent::Reasoning(reasoning) => {
             let text = reasoning.display_text();
-            (!text.is_empty()).then(|| stream_event(ChatStreamEvent::ReasoningDelta { text }))
+            (!text.is_empty()).then(|| ChatStreamEvent::ReasoningDelta { text })
         }
         StreamedAssistantContent::ReasoningDelta { reasoning, .. } if !reasoning.is_empty() => {
-            Some(stream_event(ChatStreamEvent::ReasoningDelta {
-                text: reasoning,
-            }))
+            Some(ChatStreamEvent::ReasoningDelta { text: reasoning })
         }
         StreamedAssistantContent::ToolCall { tool_call, .. } => {
-            Some(stream_event(ChatStreamEvent::ToolUpdate {
+            Some(ChatStreamEvent::ToolUpdate {
                 id: tool_call.id,
                 name: tool_call.function.name,
                 state: ToolState::Calling,
                 input: Some(tool_call.function.arguments),
                 output: None,
                 error: None,
-            }))
+            })
         }
         StreamedAssistantContent::ToolCallDelta { id, content, .. } => {
             let (name, input) = match content {
@@ -169,14 +217,14 @@ fn assistant_content_event<R>(
                     (String::new(), Some(serde_json::json!({ "delta": delta })))
                 }
             };
-            Some(stream_event(ChatStreamEvent::ToolUpdate {
+            Some(ChatStreamEvent::ToolUpdate {
                 id,
                 name,
                 state: ToolState::Streaming,
                 input,
                 output: None,
                 error: None,
-            }))
+            })
         }
         StreamedAssistantContent::Final(_) | StreamedAssistantContent::Text(_) => None,
         StreamedAssistantContent::ReasoningDelta { .. } => None,
@@ -293,12 +341,12 @@ fn stream_event(event: ChatStreamEvent) -> Result<Event, Infallible> {
     Ok(Event::default().data(data))
 }
 
-async fn rpc(Json(request): Json<RpcRequest>) -> Json<RpcResponse<serde_json::Value>> {
+async fn rpc(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<RpcRequest>,
+) -> Json<RpcResponse<serde_json::Value>> {
     if request.jsonrpc != "2.0" {
-        return Json(RpcResponse::failure(
-            request.id,
-            RpcError::invalid_request(),
-        ));
+        return Json(RpcResponse::failure(request.id, RpcError::invalid_request()));
     }
 
     match request.method.as_str() {
@@ -306,6 +354,38 @@ async fn rpc(Json(request): Json<RpcRequest>) -> Json<RpcResponse<serde_json::Va
             request.id,
             serde_json::to_value(health_response()).expect("health response serializes"),
         )),
+        RPC_SESSIONS_LIST => {
+            match sessions::list(&state.db).await {
+                Ok(list) => {
+                    let value = serde_json::to_value(list).unwrap_or(serde_json::Value::Array(vec![]));
+                    Json(RpcResponse::success(request.id, value))
+                }
+                Err(e) => Json(RpcResponse::failure(
+                    request.id,
+                    RpcError::internal_error(e.to_string()),
+                )),
+            }
+        }
+        RPC_SESSIONS_GET => {
+            let id = request
+                .params
+                .as_ref()
+                .and_then(|p| p["id"].as_str())
+                .unwrap_or("");
+            if id.is_empty() {
+                return Json(RpcResponse::failure(request.id, RpcError::invalid_request()));
+            }
+            match sessions::load_ui_messages(&state.db, id).await {
+                Ok(msgs) => {
+                    let value = serde_json::to_value(msgs).unwrap_or(serde_json::Value::Array(vec![]));
+                    Json(RpcResponse::success(request.id, value))
+                }
+                Err(e) => Json(RpcResponse::failure(
+                    request.id,
+                    RpcError::internal_error(e.to_string()),
+                )),
+            }
+        }
         _ => Json(RpcResponse::failure(
             request.id,
             RpcError::method_not_found(request.method),

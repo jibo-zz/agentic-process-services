@@ -36,34 +36,36 @@ fn render_list(app: &App, area: Rect, buf: &mut Buffer) {
     let cursor = app.sessions_cursor;
     let sessions = &app.sessions_list;
 
-    // Compute scroll offset to keep cursor visible
-    let scroll = if cursor >= inner_height {
-        cursor - inner_height + 1
-    } else {
-        0
-    };
+    // Loading state: sessions_rx is pending (not yet loaded)
+    let loading = !app.sessions_loaded;
 
     let mut lines = vec![];
 
-    if sessions.is_empty() {
+    if loading {
+        lines.push(Line::from("Loading sessions…".dim()));
+    } else if sessions.is_empty() {
         lines.push(Line::from(
             "No sessions yet. Start a conversation from the home screen.".dim(),
         ));
     } else {
-        for (i, session) in sessions.iter().enumerate().skip(scroll).take(inner_height) {
+        // Compute scroll offset to keep cursor visible
+        let scroll = if cursor >= inner_height {
+            cursor - inner_height + 1
+        } else {
+            0
+        };
+
+        for (i, summary) in sessions.iter().enumerate().skip(scroll).take(inner_height) {
             let is_selected = i == cursor;
 
-            let date = format_ts(session.created_at);
-            let title = if session.title.len() > 55 {
-                format!("{}...", &session.title[..55])
+            let date = format_ts(summary.updated_at_secs);
+            let title = if summary.title.len() > 55 {
+                format!("{}...", &summary.title[..55])
             } else {
-                session.title.clone()
+                summary.title.clone()
             };
-            let messages = format!(
-                "{} msg{}",
-                session.messages.len(),
-                if session.messages.len() == 1 { "" } else { "s" }
-            );
+            let count = summary.message_count;
+            let messages = format!("{count} msg{}", if count == 1 { "" } else { "s" });
 
             if is_selected {
                 lines.push(Line::from(vec![
@@ -121,7 +123,6 @@ fn render_footer(area: Rect, buf: &mut Buffer) {
 }
 
 fn format_ts(ts: u64) -> String {
-    // Simple formatting: show seconds-ago for recent, date for older
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

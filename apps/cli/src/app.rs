@@ -1,5 +1,5 @@
-use crate::sessions::{self, Session};
-use agentic_protocol::{ChatStreamEvent, ToolState, UiMessage, UiPart, UiRole};
+use crate::sessions::Session;
+use agentic_protocol::{ChatStreamEvent, SessionSummary, ToolState, UiMessage, UiPart, UiRole};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Clone, Default, Eq, PartialEq)]
@@ -112,9 +112,11 @@ pub struct App {
     pub chat_stream: ChatStream,
     pub chat_scroll: u16,
     // sessions list
-    pub sessions_list: Vec<Session>,
+    pub sessions_list: Vec<SessionSummary>,
+    pub sessions_loaded: bool,
     pub sessions_cursor: usize,
     pub sessions_scroll: u16,
+    pub sessions_open_pending: Option<String>,
 }
 
 impl App {
@@ -184,7 +186,7 @@ impl App {
         }
     }
 
-    /// Saves the completed turn into the session and persists to disk.
+    /// Saves the completed turn into the in-memory session (server already persisted to DB).
     pub fn finish_chat_stream(&mut self) {
         if let ChatStream::Streaming {
             user_msg,
@@ -194,7 +196,6 @@ impl App {
         {
             session.messages.push(UiMessage::user_text(user_msg));
             session.messages.push(assistant);
-            sessions::save(session);
         }
     }
 
@@ -214,7 +215,6 @@ impl App {
                 session.messages.push(UiMessage::user_text(user_msg));
             }
             session.messages.push(assistant);
-            sessions::save(session);
         }
         self.chat_stream = ChatStream::Idle;
     }
@@ -330,7 +330,9 @@ impl App {
         match normalized.as_str() {
             "home" => self.route = Route::Home,
             "sessions" => {
-                self.sessions_list = sessions::load_all();
+                if !self.sessions_loaded {
+                    // tui.rs will spawn the async load when it sees Route::Sessions
+                }
                 self.sessions_cursor = 0;
                 self.sessions_scroll = 0;
                 self.route = Route::Sessions;
@@ -341,13 +343,30 @@ impl App {
     }
 
     fn open_selected_session(&mut self) {
-        let Some(session) = self.sessions_list.get(self.sessions_cursor).cloned() else {
+        let Some(summary) = self.sessions_list.get(self.sessions_cursor) else {
             return;
         };
-        self.active_session = Some(session);
+        // Signal tui.rs to load session messages asynchronously
+        self.sessions_open_pending = Some(summary.id.clone());
+    }
+
+    /// Called by tui.rs after loading session messages from server.
+    pub fn open_loaded_session(&mut self, id: &str, messages: Vec<UiMessage>) {
+        let title = self
+            .sessions_list
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.title.clone())
+            .unwrap_or_default();
+        self.active_session = Some(Session {
+            id: id.to_owned(),
+            title,
+            messages,
+        });
         self.chat_stream = ChatStream::Idle;
         self.chat_scroll = u16::MAX;
         self.route = Route::Chat;
+        self.sessions_open_pending = None;
     }
 }
 

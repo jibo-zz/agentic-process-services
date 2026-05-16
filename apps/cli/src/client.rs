@@ -1,14 +1,16 @@
 use agentic_config::DEFAULT_SERVER_ADDR;
 use agentic_protocol::{
-    ChatMessage, ChatStreamEvent, HealthResponse, LlmResponse, RPC_HEALTH_CHECK, RPC_LLM_GENERATE,
-    RPC_PATH, RpcError, RpcRequest, RpcResponse,
+    CHAT_STREAM_PATH, ChatRequest, ChatStreamEvent, HealthResponse, RPC_HEALTH_CHECK, RPC_PATH,
+    RPC_SESSIONS_GET, RPC_SESSIONS_LIST, RpcError, RpcRequest, RpcResponse, SessionSummary,
+    UiMessage,
 };
 use futures_util::{Stream, StreamExt, stream};
 use serde::de::DeserializeOwned;
 use std::{error::Error, fmt};
 
 const RPC_HEALTH_ID: u64 = 1;
-const RPC_LLM_ID: u64 = 2;
+const RPC_SESSIONS_LIST_ID: u64 = 2;
+const RPC_SESSIONS_GET_ID: u64 = 3;
 
 #[derive(Debug)]
 pub enum FetchError {
@@ -67,28 +69,43 @@ impl Fetcher {
     }
 
     pub async fn check_health(&self) -> Result<HealthResponse, FetchError> {
-        self.rpc(RPC_HEALTH_ID, RPC_HEALTH_CHECK).await
+        self.rpc_call(RpcRequest::method(RPC_HEALTH_ID, RPC_HEALTH_CHECK))
+            .await
     }
 
-    pub async fn llm_generate(&self) -> Result<LlmResponse, FetchError> {
-        self.rpc(RPC_LLM_ID, RPC_LLM_GENERATE).await
+    pub async fn sessions_list(&self) -> Result<Vec<SessionSummary>, FetchError> {
+        self.rpc_call(RpcRequest::method(RPC_SESSIONS_LIST_ID, RPC_SESSIONS_LIST))
+            .await
+    }
+
+    pub async fn sessions_get(&self, id: &str) -> Result<Vec<UiMessage>, FetchError> {
+        self.rpc_call(
+            RpcRequest::method(RPC_SESSIONS_GET_ID, RPC_SESSIONS_GET)
+                .with_params(serde_json::json!({ "id": id })),
+        )
+        .await
     }
 
     pub async fn chat_stream(
         &self,
-        messages: &[ChatMessage],
+        session_id: &str,
+        message: &str,
     ) -> Result<impl Stream<Item = Result<ChatStreamEvent, FetchError>>, FetchError> {
-        use agentic_protocol::{CHAT_STREAM_PATH, ChatRequest};
-
         let response = self
             .http
             .post(format!("{}{CHAT_STREAM_PATH}", self.base_url))
             .json(&ChatRequest {
-                messages: messages.to_vec(),
+                session_id: session_id.to_owned(),
+                message: message.to_owned(),
             })
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(FetchError::Decode(format!("HTTP {status}: {body}")));
+        }
 
         let bytes_stream = response.bytes_stream();
 
@@ -126,14 +143,14 @@ impl Fetcher {
         ))
     }
 
-    async fn rpc<T>(&self, id: u64, method: &'static str) -> Result<T, FetchError>
+    async fn rpc_call<T>(&self, req: RpcRequest) -> Result<T, FetchError>
     where
         T: DeserializeOwned,
     {
         let response: RpcResponse<T> = self
             .http
             .post(format!("{}{}", self.base_url, RPC_PATH))
-            .json(&RpcRequest::method(id, method))
+            .json(&req)
             .send()
             .await?
             .error_for_status()?

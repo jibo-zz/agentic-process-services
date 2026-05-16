@@ -6,6 +6,8 @@ use serde_json::Value;
 pub const RPC_PATH: &str = "/rpc";
 pub const RPC_HEALTH_CHECK: &str = "health.check";
 pub const RPC_LLM_GENERATE: &str = "llm.generate";
+pub const RPC_SESSIONS_LIST: &str = "sessions.list";
+pub const RPC_SESSIONS_GET: &str = "sessions.get";
 pub const CHAT_STREAM_PATH: &str = "/chat/stream";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,7 +18,16 @@ pub struct ChatMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
-    pub messages: Vec<ChatMessage>, // full history; last entry must be the new user message
+    pub session_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub title: String,
+    pub updated_at_secs: u64,
+    pub message_count: u64,
 }
 pub const LLM_PREAMBLE: &str = "You are usful assistance.";
 
@@ -40,6 +51,53 @@ impl UiMessage {
         Self {
             role: UiRole::Assistant,
             parts: vec![],
+        }
+    }
+
+    pub fn apply_stream_event(&mut self, event: &ChatStreamEvent) {
+        match event {
+            ChatStreamEvent::TextDelta { text } => {
+                if let Some(UiPart::Text { content }) = self.parts.last_mut() {
+                    content.push_str(text);
+                } else {
+                    self.parts.push(UiPart::Text { content: text.clone() });
+                }
+            }
+            ChatStreamEvent::ReasoningDelta { text } => {
+                if let Some(UiPart::Reasoning { content }) = self.parts.last_mut() {
+                    content.push_str(text);
+                } else {
+                    self.parts.push(UiPart::Reasoning { content: text.clone() });
+                }
+            }
+            ChatStreamEvent::ToolUpdate { id, name, state, input, output, error } => {
+                let pos = self.parts.iter().position(|p| {
+                    matches!(p, UiPart::Tool { id: tid, .. } if tid == id)
+                });
+                if let Some(idx) = pos {
+                    if let UiPart::Tool { state: s, input: inp, output: out, error: err, .. } =
+                        &mut self.parts[idx]
+                    {
+                        *s = *state;
+                        if input.is_some() { *inp = input.clone(); }
+                        if output.is_some() { *out = output.clone(); }
+                        if error.is_some() { *err = error.clone(); }
+                    }
+                } else {
+                    self.parts.push(UiPart::Tool {
+                        id: id.clone(),
+                        name: name.clone(),
+                        state: *state,
+                        input: input.clone(),
+                        output: output.clone(),
+                        error: error.clone(),
+                    });
+                }
+            }
+            ChatStreamEvent::Error { message } => {
+                self.parts.push(UiPart::Error { message: message.clone() });
+            }
+            ChatStreamEvent::MessageStart { .. } | ChatStreamEvent::MessageDone => {}
         }
     }
 }
@@ -165,6 +223,11 @@ impl RpcRequest {
             params: None,
             id,
         }
+    }
+
+    pub fn with_params(mut self, params: serde_json::Value) -> Self {
+        self.params = Some(params);
+        self
     }
 }
 

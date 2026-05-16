@@ -14,7 +14,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let app = server::app();
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL env var not set")?;
+    let db = agentic_db::connect(&database_url).await?;
+
+    let app = server::app(db);
     let config = ServerConfig::from_env()?;
     let listener = tokio::net::TcpListener::bind(config.addr).await?;
 

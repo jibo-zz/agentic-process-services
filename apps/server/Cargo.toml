@@ -9,6 +9,7 @@ license.workspace = true
 # Versions are inherited from the workspace root to keep app dependencies aligned.
 agentic-config.workspace = true
 agentic-core.workspace = true
+agentic-db.workspace = true
 agentic-protocol.workspace = true
 axum.workspace = true
 dotenvy.workspace = true

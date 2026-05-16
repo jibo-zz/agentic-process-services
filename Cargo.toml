@@ -7,6 +7,7 @@ members = [
     "crates/core",
     "crates/config",
     "crates/protocol",
+    "crates/db",
 ]
 resolver = "3"
 
@@ -20,7 +21,11 @@ license = "MIT"
 # Keep third-party versions here so apps use the same dependency graph.
 agentic-config = { path = "crates/config" }
 agentic-core = { path = "crates/core" }
+agentic-db = { path = "crates/db" }
 agentic-protocol = { path = "crates/protocol" }
+chrono = { version = "0.4", features = ["serde"] }
+sea-orm = { version = "=2.0.0-rc.38", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 axum = "0.8"
 color-eyre = "0.6"
 crossterm = "0.29"

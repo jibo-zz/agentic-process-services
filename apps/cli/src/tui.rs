@@ -1,7 +1,7 @@
 use crate::{app::App, ui};
 use color_eyre::eyre::Result;
 use crossterm::{
-    event::{self, Event, KeyEventKind, MouseEventKind},
+    event::{self, Event, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -10,8 +10,8 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{io, panic, sync::mpsc, time::Duration};
 
 use crate::app::Route;
-use agentic_protocol::ChatStreamEvent;
-use cli::client::Fetcher;
+use agentic_protocol::{ChatStreamEvent, SessionSummary, UiMessage};
+use cli::client::{FetchError, Fetcher};
 
 enum ChatEvent {
     Stream(ChatStreamEvent),
@@ -31,16 +31,47 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
     let fetcher = Fetcher::local();
     let runtime = tokio::runtime::Runtime::new()?;
     let mut chat_rx: Option<mpsc::Receiver<ChatEvent>> = None;
+    let mut sessions_rx: Option<mpsc::Receiver<Result<Vec<SessionSummary>, FetchError>>> = None;
+    let mut sessions_open_rx: Option<mpsc::Receiver<Result<(String, Vec<UiMessage>), FetchError>>> =
+        None;
 
     loop {
+        // Spawn sessions list load when navigating to Sessions for the first time.
+        if matches!(app.route, Route::Sessions) && !app.sessions_loaded && sessions_rx.is_none() {
+            let (tx, rx) = mpsc::channel();
+            sessions_rx = Some(rx);
+            let f = fetcher.clone();
+            runtime.spawn(async move {
+                let _ = tx.send(f.sessions_list().await);
+            });
+        }
+
+        // Spawn session open task when a session is selected.
+        if let Some(ref id) = app.sessions_open_pending.clone() {
+            if sessions_open_rx.is_none() {
+                let (tx, rx) = mpsc::channel();
+                sessions_open_rx = Some(rx);
+                let f = fetcher.clone();
+                let id = id.clone();
+                runtime.spawn(async move {
+                    let result = f.sessions_get(&id).await.map(|msgs| (id, msgs));
+                    let _ = tx.send(result);
+                });
+            }
+        }
+
         // Spawn streaming task when a pending prompt is waiting.
         if matches!(app.route, Route::Chat) && app.chat_stream().is_pending() {
-            // Build the full message list: session history + new user message
-            let messages = app
+            let session_id = app
                 .active_session
                 .as_ref()
-                .map(|s| s.to_chat_messages(app.chat_stream().pending_prompt()))
+                .map(|s| s.id.clone())
                 .unwrap_or_default();
+            let message = app
+                .chat_stream()
+                .pending_prompt()
+                .unwrap_or_default()
+                .to_owned();
 
             let (tx, rx) = mpsc::channel();
             chat_rx = Some(rx);
@@ -48,7 +79,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
 
             let f = fetcher.clone();
             runtime.spawn(async move {
-                match f.chat_stream(&messages).await {
+                match f.chat_stream(&session_id, &message).await {
                     Err(e) => {
                         let _ = tx.send(ChatEvent::Err(e.to_string()));
                     }
@@ -75,6 +106,35 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                     }
                 }
             });
+        }
+
+        // Drain sessions list result.
+        if let Some(ref rx) = sessions_rx {
+            if let Ok(result) = rx.try_recv() {
+                match result {
+                    Ok(list) => {
+                        app.sessions_list = list;
+                        app.sessions_loaded = true;
+                    }
+                    Err(_) => {
+                        // Leave sessions_loaded = false so retries work on next navigation.
+                    }
+                }
+                sessions_rx = None;
+            }
+        }
+
+        // Drain session open result.
+        if let Some(ref rx) = sessions_open_rx {
+            if let Ok(result) = rx.try_recv() {
+                match result {
+                    Ok((id, messages)) => app.open_loaded_session(&id, messages),
+                    Err(_) => {
+                        app.sessions_open_pending = None;
+                    }
+                }
+                sessions_open_rx = None;
+            }
         }
 
         // Drain pending chat events before rendering.
@@ -114,21 +174,16 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                 Event::Key(key) if key.kind == KeyEventKind::Press && app.handle_key(key) => {
                     break;
                 }
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp if matches!(app.route, Route::Chat) => {
-                        app.scroll_chat_up()
-                    }
-                    MouseEventKind::ScrollDown if matches!(app.route, Route::Chat) => {
-                        app.scroll_chat_down()
-                    }
-                    _ => {}
-                },
                 _ => {}
             }
         }
 
         if !matches!(app.route, Route::Chat) {
             chat_rx = None;
+        }
+        if !matches!(app.route, Route::Sessions) {
+            sessions_rx = None;
+            sessions_open_rx = None;
         }
     }
     Ok(())
@@ -137,17 +192,15 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, event::EnableMouseCapture)?;
+    // Mouse capture is intentionally OFF so users can select text natively
+    // (drag-to-highlight + Cmd/Ctrl+C). Up/Down keys still scroll the chat.
+    execute!(stdout, EnterAlternateScreen)?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
 fn restore_terminal() -> Result<()> {
     disable_raw_mode()?;
-    execute!(
-        io::stdout(),
-        event::DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
+    execute!(io::stdout(), LeaveAlternateScreen)?;
     Ok(())
 }
 
