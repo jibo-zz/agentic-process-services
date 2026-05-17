@@ -173,6 +173,15 @@ fn push_part_lines(part: &UiPart, streaming: bool, lines: &mut Vec<Line>) {
             if let Some(message) = error {
                 push_labeled_content("tool error >", message, Style::new().red(), false, lines);
             }
+            if *state == ToolState::AwaitingApproval {
+                push_labeled_content(
+                    "approval >",
+                    "Press Y to approve or N to reject",
+                    Style::new().yellow(),
+                    false,
+                    lines,
+                );
+            }
         }
         UiPart::Error { message } => {
             push_labeled_content("error >", message, Style::new().red(), false, lines)
@@ -200,7 +209,7 @@ fn push_labeled_content(
         let prefix = if index == 0 {
             format!("  {label} ")
         } else {
-            "  ".repeat(1) + &" ".repeat(label.len() + 1)
+            "  ".to_string() + &" ".repeat(label.len() + 1)
         };
         let suffix = if streaming && index == content.lines().count().saturating_sub(1) {
             "▌"

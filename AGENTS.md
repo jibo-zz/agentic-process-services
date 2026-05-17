@@ -1,67 +1,67 @@
 # AGENTS.md
 
 ## Repo Shape
-- Rust 2024 Cargo workspace with resolver `3`; root `Cargo.toml` is the source of truth for members and shared dependency versions.
-- Runnable products live in `apps/`: `apps/server` is the Axum HTTP service, `apps/cli` is the Ratatui/Crossterm TUI.
-- Shared libraries live in `crates/`; do not couple `apps/server` and `apps/cli` directly.
-- `crates/core` — domain constants. `crates/config` — env/config loading (`APS_SERVER_ADDR`, default `127.0.0.1:3000`). `crates/protocol` — shared DTOs and RPC method names. `crates/db` — SeaORM entities + repos.
+- Rust 2024 Cargo workspace with resolver `3`; root `Cargo.toml` owns members and shared dependency versions.
+- Runnable products live in `apps/`: `apps/server` is the hosted Axum service, `apps/cli` is the local Ratatui/Crossterm TUI.
+- Shared crates live in `crates/`: `agentic-protocol` for API/SSE/RPC DTOs, `agentic-db` for SeaORM persistence, `agentic-tools` for tool contracts/local executors/guardrails.
+- Do not couple `apps/server` and `apps/cli` directly; move shared logic into `crates/`.
 
-## Code Organization
-- Keep app entrypoints thin; `main.rs` installs error/panic handling and delegates.
-- In `apps/cli`: `app.rs` owns state and input logic, `tui.rs` owns the terminal event loop, `ui/<screen>.rs` owns rendering. Don't blur these boundaries.
-- CLI navigation uses slash commands (`/home`, `/sessions`); unknown routes render a Not Found page. Active routes: `Home`, `Chat`, `Sessions`, `Missing`.
-- `Enter` submits the textarea; `Ctrl+Enter` / `Alt+Enter` insert newlines. Keybindings are declared explicitly in `app.rs`.
-- Move any code shared between `apps/server` and `apps/cli` into a `crates/` library.
-- `apps/cli/src/client.rs` exposes typed wrapper methods (`check_health`, `chat_stream`, `sessions_list`, `sessions_get`). Raw RPC construction stays private to the client layer via `rpc_call<T>()`. RPC constants and DTOs belong in `agentic-protocol`.
-- Server tool implementations stay server-only (`apps/server/src/tools.rs`); CLI renders generic `ChatStreamEvent` / `UiPart` data and must not depend on Rig, Open-Meteo, or provider-specific tool types.
+## Boundaries
+- Keep entrypoints thin; `main.rs` installs runtime/error/panic handling and delegates.
+- In `apps/cli`: `app.rs` owns state/input, `tui.rs` owns the event loop and async task spawning, `ui/<screen>.rs` owns rendering.
+- `apps/cli/src/client.rs` exposes typed wrappers (`check_health`, `chat_stream`, `sessions_list`, `sessions_get`, `tools_list`, `tools_result`); raw JSON-RPC stays private behind `rpc_call<T>()`.
+- The CLI must not depend on Rig, Open-Meteo, or provider-specific tool types. It executes generic local tool requests and renders generic protocol events.
 
-## Streaming
-- JSON-RPC can't stream (one request, one response) — use a dedicated SSE endpoint instead. Path constant and event DTO live in `agentic-protocol`; SSE wire-format parsing stays inside the client wrapper.
-- `POST /chat/stream` takes `ChatRequest { session_id, message }` — the server loads prior turns from Postgres, not from the client. Wire stays small and history can't be tampered with.
-- `/chat/stream` emits `ChatStreamEvent` SSE payloads (not raw text chunks) so reasoning, text, tool updates, and non-terminal errors all render in-place in the TUI.
-- The TUI event loop uses `event::poll(50ms)` + `std::sync::mpsc`; spawn tokio tasks via `runtime.spawn()`, drain with `try_recv()` before `terminal.draw()`.
-- Guard task spawn with `app.chat_stream().is_pending()` to prevent double-spawning. Set `chat_rx = None` when navigating away — the spawned task exits naturally when its sender errors.
-- Tool updates are upserted by tool-call id while text/reasoning deltas append to the last matching part; this avoids tool-block flicker and preserves scroll stability.
-- Server-side persistence is a side-channel on the SSE stream: `inspect()` clones each `ChatStreamEvent` into a `tokio::sync::mpsc::unbounded_channel`, a spawned task accumulates via `UiMessage::apply_stream_event()`, and commits the assistant turn on `MessageDone`. Don't block the SSE stream on DB writes.
+## Chat Streaming
+- Chat uses `POST /chat/stream` SSE, not JSON-RPC. JSON-RPC remains for non-streaming calls on `POST /rpc`.
+- The server loads prior turns from Postgres using `ChatRequest { session_id, message }`; clients do not send chat history.
+- The TUI loop uses `event::poll(50ms)` + `std::sync::mpsc`; spawn tokio work via `runtime.spawn()` and drain with `try_recv()` before drawing.
+- Tool UI parts are upserted by tool-call id. Auto-approved local tools should rely on Rig `ToolCall` / `ToolResult` events for visible blocks; render bridge-only blocks for approval-required operations.
+- Persist assistant turns as a side-channel from sanitized stream events. Never block the SSE stream on DB writes.
 
-## Session Persistence (Postgres / SeaORM)
-- Sessions and messages live in Postgres. `agentic-db` owns entities and repo functions; `messages.parts` is `JSONB` storing `Vec<UiPart>`.
-- Schema sync runs on server boot inside `agentic_db::connect()` via `Schema::create_table_from_entity(...).if_not_exists()`. No migration crate. Adding a column to an entity makes it appear on next startup.
-- `sessions::upsert` uses `ON CONFLICT … DO UPDATE SET updated_at = …`. Don't use `do_nothing()`: SeaORM 2.0-rc raises `DbErr::RecordNotInserted` when no rows are affected. A `match` on that variant in the repo function covers any remaining edge cases.
-- `sessions::load_history()` returns text-only `Vec<ChatMessage>` for the LLM; `sessions::load_ui_messages()` returns the rich `Vec<UiMessage>` for the Sessions screen. Reasoning, tool state, and UI errors are persisted but not sent to the model.
-- `DatabaseConnection` is re-exported from `agentic-db` so `apps/server` doesn't need a direct `sea-orm` dependency.
-- SeaORM is pinned to `=2.0.0-rc.38` — no stable 2.0 yet. Bump when 2.0 stable lands.
-- Session IDs are still CLI-generated zero-padded 16-digit hex Unix milliseconds (`apps/cli/src/sessions.rs::Session::new`). The CLI sends the id; the server upserts it on first message.
-- Esc on the Sessions screen navigates to `Route::Home`, not quit.
-- Sessions list and session-open load asynchronously via the same mpsc+drain pattern as chat streaming (see `apps/cli/src/tui.rs`); the loading state is rendered as "Loading sessions…".
+## Hybrid Tool Runtime
+- Rig runs on the server; local filesystem tools execute in the CLI. Never attach real filesystem tools directly to the hosted server.
+- `agentic-tools` owns names, schemas, `ToolDescriptor`s, execution kind, risk, output policy, approval requirement, `WorkspaceGuard`, and local executor routing.
+- Execution kinds are explicit: `ServerNative` runs in `apps/server`; `LocalProxy` is advertised by the server and executed by the CLI through `ToolBridge`.
+- The bridge uses `StreamReady { stream_id, stream_secret }`, `LocalToolRequest` over SSE, and `tools.result` JSON-RPC callbacks. Do not persist real stream secrets.
+- Full local tool outputs may be returned to Rig in memory, but UI/database persistence must store summaries only. Do not persist full source files or absolute local paths on the hosted server.
+- Rig tool loops need an explicit multi-turn budget (`AGENT_MAX_TOOL_TURNS`) on both the agent and streaming prompt request.
 
-## CLI Mouse / Selection
-- Mouse capture is intentionally OFF in `apps/cli/src/tui.rs::init_terminal` so drag-select + `Cmd+C` (or `Ctrl+Shift+C`) work via the terminal natively. Cost: mouse wheel doesn't scroll chat. Up/Down arrows scroll instead; footer reads `↑↓ scroll`.
-- Crossterm's `EnableMouseCapture` is all-or-nothing — there's no scroll-only mode. Don't try to re-enable it without an explicit toggle UI, because it breaks drag-select.
+## Local Tool Safety
+- The CLI workspace root is `std::env::current_dir().canonicalize()` at startup.
+- All local path tools must go through `WorkspaceGuard`; block absolute paths, `..`, symlink escapes, `.git`, `target`, `.env*`, `.pem`, and `.key`.
+- Read-only tools run automatically. Mutating tools require inline CLI `Y/N` approval.
+- `delete_file` deletes files only. `delete_directory` deletes empty directories only, refuses files, refuses the workspace root, and is not recursive.
+- Do not add `run_command` or recursive deletion without a separate design pass for process control, timeouts, and stronger approval.
 
-## Tools
-- `get_current_weather` is a single Rig tool that internally geocodes and fetches weather via Open-Meteo to keep the agent loop short; Celsius is the default unless the user explicitly asks for Fahrenheit.
-- Rig 0.36 agent streams expose completed tool calls/results and reasoning/text events; tool-call delta UI is still covered by `debug:tool-stream` because the public agent stream path may not yield deltas without hooks.
-- `debug:tool-stream` is an exact prompt trigger for testing reasoning, tool states, non-terminal errors, and final text over the real SSE/client path without spending model credits. It also bypasses the DB persistence side-channel.
+## Tools Page And Creation
+- `/tools` is the tool control center. It merges server `tools.list` with the local `agentic-tools` registry and shows `Active`, `MissingLocally`, or `MissingRemotely` status.
+- Keep `/tools` rendering in `apps/cli/src/ui/tools.rs`; keep route/input/state handling in `app.rs`.
+- New compiled Rust tools require code changes, rebuild, and restart. Runtime plugins are deferred until there is a sandboxing/signing design.
+- Agent-created tools require two approvals before edits: conceptual proposal, then implementation review listing exact files to modify/create.
+- Explicit user placement overrides heuristics unless unsafe. Default local filesystem/workspace tools to `LocalProxy`; public API or hosted-secret tools to `ServerNative`.
 
-## Environment
-- The server loads `apps/server/.env` via `dotenvy::from_path(Path::new(env!("CARGO_MANIFEST_DIR")).join(".env"))` — works regardless of the working directory `cargo run` is invoked from.
-- `DEEPSEEK_API_KEY` must be set for the LLM streaming endpoint.
-- `DATABASE_URL` must be a Postgres connection string (Neon works); tables are auto-created on first server boot via schema sync.
+## Persistence
+- Sessions and messages live in Postgres. `messages.parts` is `JSONB` storing `Vec<UiPart>`.
+- Schema sync runs on server boot in `agentic_db::connect()` using SeaORM `create_table_from_entity(...).if_not_exists()`. No migration crate yet.
+- `sessions::load_history()` returns text-only model history; `sessions::load_ui_messages()` returns rich UI messages. Reasoning/tool/UI errors persist but are not sent to the model.
+- SeaORM is pinned to `=2.0.0-rc.38` until stable 2.0 lands.
 
-## Commands
+## UX Notes
+- Routes: `/home`, `/sessions`, `/tools`; unknown routes render Not Found.
+- `Enter` submits; `Ctrl+Enter` / `Alt+Enter` insert newlines.
+- Esc on Sessions and Tools returns Home; elsewhere it quits unless an inline input/approval consumes it.
+- Mouse capture is intentionally off so terminal-native selection and copy work. Use arrow keys for chat scrolling.
+
+## Environment And Commands
+- Server loads `apps/server/.env`; `DEEPSEEK_API_KEY` and `DATABASE_URL` are required for normal chat operation.
+- CLI uses `AGENTS_SERVER_URL` for remote/staging, defaulting to `http://127.0.0.1:3000`.
 - Check: `cargo check --workspace`
 - Test: `cargo test --workspace`
 - Format: `cargo fmt --all` / `cargo fmt --all -- --check`
 - Lint: `cargo clippy --workspace --all-targets`
-- Run server: `cargo run -p server` → binds `127.0.0.1:3000`, exposes `GET /health`, `POST /chat/stream`, `POST /rpc` (methods: `health.check`, `sessions.list`, `sessions.get`).
+- Run server: `cargo run -p server`
 - Run TUI: `cargo run -p cli`
 
 ## Git
-- Commit subjects: short, imperative, title-cased, no trailing period — e.g. `Build agent-style CLI home screen`.
-
-## Runtime Notes
-- Server logging: `tracing_subscriber` with `RUST_LOG`; default filter `server=info`.
-- Client errors surface response body via `FetchError::Decode("HTTP <status>: <body>")` — don't use `error_for_status()` in the client, it discards the body and hides server-side error context.
-- No README, CI, or task runner yet; prefer Cargo commands over project scripts.
-- Release profile: `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`.
+- Commit subjects: short, imperative, title-cased, no trailing period — e.g. `Build Hybrid Coding Agent Tool Runtime`.

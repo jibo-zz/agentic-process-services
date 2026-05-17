@@ -1,12 +1,13 @@
+mod tool_bridge;
 mod tools;
 
-use agentic_db::{
-    repo::{messages, sessions},
-};
+use agentic_db::DatabaseConnection;
+use agentic_db::repo::{messages, sessions};
 use agentic_protocol::{
     CHAT_STREAM_PATH, ChatRequest, ChatStreamEvent, HealthResponse, LLM_PREAMBLE, RPC_HEALTH_CHECK,
-    RPC_PATH, RPC_SESSIONS_GET, RPC_SESSIONS_LIST, RpcError, RpcRequest, RpcResponse,
-    ToolState, UiMessage, UiRole,
+    RPC_PATH, RPC_SESSIONS_GET, RPC_SESSIONS_LIST, RPC_TOOLS_LIST, RPC_TOOLS_RESULT, RpcError,
+    RpcRequest, RpcResponse, ToolResultAck, ToolResultParams, ToolState, ToolsListResponse,
+    UiMessage, UiRole,
 };
 use axum::{
     Json, Router,
@@ -35,19 +36,24 @@ use rig::{
         StreamedAssistantContent, StreamedUserContent, StreamingPrompt, ToolCallDeltaContent,
     },
 };
-use agentic_db::DatabaseConnection;
 use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
+use tool_bridge::ToolBridge;
 
 pub type AppType = Router;
+const AGENT_MAX_TOOL_TURNS: usize = 12;
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: DatabaseConnection,
+    pub bridge: ToolBridge,
 }
 
 pub fn app(db: DatabaseConnection) -> AppType {
-    let state = Arc::new(AppState { db });
+    let state = Arc::new(AppState {
+        db,
+        bridge: ToolBridge::new(),
+    });
     Router::new()
         .route("/health", get(health))
         .route(CHAT_STREAM_PATH, post(chat_stream))
@@ -64,7 +70,10 @@ async fn chat_stream(
     Json(req): Json<ChatRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     if req.message.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "message must not be empty".to_owned()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "message must not be empty".to_owned(),
+        ));
     }
 
     if req.message == "debug:tool-stream" {
@@ -78,21 +87,21 @@ async fn chat_stream(
     // Upsert session, count prior messages, load LLM history — all before inserting user turn
     sessions::upsert(&state.db, &session_id, &title)
         .await
-        .map_err(|e| internal_error(e))?;
+        .map_err(internal_error)?;
 
     let user_position = messages::count(&state.db, &session_id)
         .await
-        .map_err(|e| internal_error(e))?;
+        .map_err(internal_error)?;
 
     let prior_chat_messages = sessions::load_history(&state.db, &session_id)
         .await
-        .map_err(|e| internal_error(e))?;
+        .map_err(internal_error)?;
 
     // Insert user message
     let user_msg = UiMessage::user_text(&prompt);
     messages::insert(&state.db, &session_id, user_position, &user_msg)
         .await
-        .map_err(|e| internal_error(e))?;
+        .map_err(internal_error)?;
 
     let prior_rig_messages: Vec<RigMessage> = prior_chat_messages
         .iter()
@@ -115,17 +124,30 @@ async fn chat_stream(
         .collect();
 
     let client = deepseek::Client::from_env().map_err(internal_error)?;
+    let stream_auth = state.bridge.new_stream();
+    let (event_tx, event_rx) = mpsc::unbounded_channel::<ChatStreamEvent>();
+    let local_tool_context =
+        tools::LocalToolContext::new(state.bridge.clone(), stream_auth.clone(), event_tx.clone());
     let preamble = format!(
-        "{LLM_PREAMBLE}\n\nUse the get_current_weather tool for current weather questions. The tool defaults to celsius; request fahrenheit only if the user explicitly asks for it."
+        "{LLM_PREAMBLE}\n\nYou are a coding agent. Use local file tools to inspect and modify the user's workspace instead of guessing, but keep research focused and answer once you have enough evidence. Use read_file before editing existing files. write_file, edit_file, delete_file, and delete_directory require user approval in the CLI. Use delete_file when the user asks to remove a file; use delete_directory only for empty directories. Do not empty a file as a substitute for deletion. Use get_current_weather for current weather questions; it defaults to celsius and should use fahrenheit only when explicitly requested."
     );
     let agent = client
         .agent(deepseek::DEEPSEEK_V4_FLASH)
         .preamble(&preamble)
+        .default_max_turns(AGENT_MAX_TOOL_TURNS)
         .tool(tools::CurrentWeatherTool)
+        .tool(tools::ListFilesProxyTool::new(local_tool_context.clone()))
+        .tool(tools::ReadFileProxyTool::new(local_tool_context.clone()))
+        .tool(tools::SearchFilesProxyTool::new(local_tool_context.clone()))
+        .tool(tools::WriteFileProxyTool::new(local_tool_context.clone()))
+        .tool(tools::EditFileProxyTool::new(local_tool_context.clone()))
+        .tool(tools::DeleteFileProxyTool::new(local_tool_context.clone()))
+        .tool(tools::DeleteDirectoryProxyTool::new(local_tool_context))
         .build();
 
     let agent_stream = agent
         .stream_prompt(&prompt)
+        .multi_turn(AGENT_MAX_TOOL_TURNS)
         .with_history(prior_rig_messages)
         .await
         .filter_map(|item| async move { stream_item_to_chat_event(item) })
@@ -134,11 +156,31 @@ async fn chat_stream(
             event
         });
 
-    let full_stream: BoxStream<ChatStreamEvent> =
-        stream::iter([ChatStreamEvent::MessageStart { role: UiRole::Assistant }])
-            .chain(agent_stream)
-            .chain(stream::iter([ChatStreamEvent::MessageDone]))
-            .boxed();
+    tokio::spawn(async move {
+        tokio::pin!(agent_stream);
+        while let Some(event) = agent_stream.next().await {
+            if event_tx.send(event).is_err() {
+                return;
+            }
+        }
+        let _ = event_tx.send(ChatStreamEvent::MessageDone);
+    });
+
+    let event_stream = stream::unfold(event_rx, |mut rx| async move {
+        rx.recv().await.map(|event| (event, rx))
+    });
+
+    let full_stream: BoxStream<ChatStreamEvent> = stream::iter([
+        ChatStreamEvent::StreamReady {
+            stream_id: stream_auth.stream_id,
+            stream_secret: stream_auth.stream_secret,
+        },
+        ChatStreamEvent::MessageStart {
+            role: UiRole::Assistant,
+        },
+    ])
+    .chain(event_stream)
+    .boxed();
 
     // Side-channel: accumulate assistant message and persist on MessageDone
     let (persist_tx, mut persist_rx) = mpsc::unbounded_channel::<ChatStreamEvent>();
@@ -152,7 +194,8 @@ async fn chat_stream(
             if matches!(event, ChatStreamEvent::MessageDone) {
                 let db = &state_clone.db;
                 let _ = sessions::touch_updated_at(db, &session_id_clone).await;
-                let _ = messages::insert(db, &session_id_clone, assistant_position, &assistant_msg).await;
+                let _ = messages::insert(db, &session_id_clone, assistant_position, &assistant_msg)
+                    .await;
                 break;
             }
             assistant_msg.apply_stream_event(&event);
@@ -161,7 +204,7 @@ async fn chat_stream(
 
     let sse_stream: BoxStream<Result<Event, Infallible>> = full_stream
         .inspect(move |event| {
-            let _ = persist_tx.send(event.clone());
+            let _ = persist_tx.send(sanitize_event_for_persistence(event));
         })
         .map(stream_event)
         .boxed();
@@ -169,11 +212,74 @@ async fn chat_stream(
     Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
 }
 
+fn sanitize_event_for_persistence(event: &ChatStreamEvent) -> ChatStreamEvent {
+    match event {
+        ChatStreamEvent::ToolUpdate {
+            id,
+            name,
+            state,
+            input,
+            output,
+            error,
+        } => ChatStreamEvent::ToolUpdate {
+            id: id.clone(),
+            name: name.clone(),
+            state: *state,
+            input: input.as_ref().map(sanitize_tool_value),
+            output: output.as_ref().map(sanitize_tool_value),
+            error: error.clone(),
+        },
+        ChatStreamEvent::LocalToolRequest {
+            invocation_id,
+            name,
+            approval_required,
+            summary,
+            ..
+        } => ChatStreamEvent::LocalToolRequest {
+            invocation_id: invocation_id.clone(),
+            name: name.clone(),
+            input: serde_json::json!({ "summary": summary }),
+            approval_required: *approval_required,
+            summary: summary.clone(),
+        },
+        ChatStreamEvent::StreamReady { .. } => ChatStreamEvent::StreamReady {
+            stream_id: String::new(),
+            stream_secret: String::new(),
+        },
+        event => event.clone(),
+    }
+}
+
+fn sanitize_tool_value(value: &serde_json::Value) -> serde_json::Value {
+    let mut output = serde_json::Map::new();
+    for key in [
+        "summary",
+        "path",
+        "query",
+        "bytes",
+        "lines",
+        "truncated",
+        "overwritten",
+        "replacements",
+    ] {
+        if let Some(value) = value.get(key) {
+            output.insert(key.to_owned(), value.clone());
+        }
+    }
+    if output.is_empty() {
+        serde_json::json!({ "summary": "Tool event" })
+    } else {
+        serde_json::Value::Object(output)
+    }
+}
+
 fn stream_item_to_chat_event<R>(
     item: Result<MultiTurnStreamItem<R>, impl std::fmt::Display>,
 ) -> Option<ChatStreamEvent> {
     match item {
-        Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => assistant_content_to_chat_event(content),
+        Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => {
+            assistant_content_to_chat_event(content)
+        }
         Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
             tool_result,
             ..
@@ -195,21 +301,19 @@ fn assistant_content_to_chat_event<R>(
         }
         StreamedAssistantContent::Reasoning(reasoning) => {
             let text = reasoning.display_text();
-            (!text.is_empty()).then(|| ChatStreamEvent::ReasoningDelta { text })
+            (!text.is_empty()).then_some(ChatStreamEvent::ReasoningDelta { text })
         }
         StreamedAssistantContent::ReasoningDelta { reasoning, .. } if !reasoning.is_empty() => {
             Some(ChatStreamEvent::ReasoningDelta { text: reasoning })
         }
-        StreamedAssistantContent::ToolCall { tool_call, .. } => {
-            Some(ChatStreamEvent::ToolUpdate {
-                id: tool_call.id,
-                name: tool_call.function.name,
-                state: ToolState::Calling,
-                input: Some(tool_call.function.arguments),
-                output: None,
-                error: None,
-            })
-        }
+        StreamedAssistantContent::ToolCall { tool_call, .. } => Some(ChatStreamEvent::ToolUpdate {
+            id: tool_call.id,
+            name: tool_call.function.name,
+            state: ToolState::Calling,
+            input: Some(tool_call.function.arguments),
+            output: None,
+            error: None,
+        }),
         StreamedAssistantContent::ToolCallDelta { id, content, .. } => {
             let (name, input) = match content {
                 ToolCallDeltaContent::Name(name) => (name, None),
@@ -247,9 +351,22 @@ fn tool_result_event(tool_result: rig::completion::message::ToolResult) -> ChatS
             name: String::new(),
             state: ToolState::Complete,
             input: None,
-            output: Some(output),
+            output: Some(sanitize_local_tool_result_for_ui(output)),
             error: None,
         },
+    }
+}
+
+fn sanitize_local_tool_result_for_ui(output: serde_json::Value) -> serde_json::Value {
+    let is_local_file_tool = output.get("content").is_some()
+        || output.get("files").is_some()
+        || output.get("matches").is_some()
+        || output.get("overwritten").is_some()
+        || output.get("replacements").is_some();
+    if is_local_file_tool {
+        agentic_tools::sanitized_output("local_file_tool", &output)
+    } else {
+        output
     }
 }
 
@@ -346,7 +463,10 @@ async fn rpc(
     Json(request): Json<RpcRequest>,
 ) -> Json<RpcResponse<serde_json::Value>> {
     if request.jsonrpc != "2.0" {
-        return Json(RpcResponse::failure(request.id, RpcError::invalid_request()));
+        return Json(RpcResponse::failure(
+            request.id,
+            RpcError::invalid_request(),
+        ));
     }
 
     match request.method.as_str() {
@@ -354,10 +474,32 @@ async fn rpc(
             request.id,
             serde_json::to_value(health_response()).expect("health response serializes"),
         )),
-        RPC_SESSIONS_LIST => {
-            match sessions::list(&state.db).await {
-                Ok(list) => {
-                    let value = serde_json::to_value(list).unwrap_or(serde_json::Value::Array(vec![]));
+        RPC_SESSIONS_LIST => match sessions::list(&state.db).await {
+            Ok(list) => {
+                let value = serde_json::to_value(list).unwrap_or(serde_json::Value::Array(vec![]));
+                Json(RpcResponse::success(request.id, value))
+            }
+            Err(e) => Json(RpcResponse::failure(
+                request.id,
+                RpcError::internal_error(e.to_string()),
+            )),
+        },
+        RPC_SESSIONS_GET => {
+            let id = request
+                .params
+                .as_ref()
+                .and_then(|p| p["id"].as_str())
+                .unwrap_or("");
+            if id.is_empty() {
+                return Json(RpcResponse::failure(
+                    request.id,
+                    RpcError::invalid_request(),
+                ));
+            }
+            match sessions::load_ui_messages(&state.db, id).await {
+                Ok(msgs) => {
+                    let value =
+                        serde_json::to_value(msgs).unwrap_or(serde_json::Value::Array(vec![]));
                     Json(RpcResponse::success(request.id, value))
                 }
                 Err(e) => Json(RpcResponse::failure(
@@ -366,23 +508,40 @@ async fn rpc(
                 )),
             }
         }
-        RPC_SESSIONS_GET => {
-            let id = request
-                .params
-                .as_ref()
-                .and_then(|p| p["id"].as_str())
-                .unwrap_or("");
-            if id.is_empty() {
-                return Json(RpcResponse::failure(request.id, RpcError::invalid_request()));
-            }
-            match sessions::load_ui_messages(&state.db, id).await {
-                Ok(msgs) => {
-                    let value = serde_json::to_value(msgs).unwrap_or(serde_json::Value::Array(vec![]));
+        RPC_TOOLS_LIST => {
+            let value = serde_json::to_value(ToolsListResponse {
+                tools: agentic_tools::descriptors(),
+            })
+            .unwrap_or_else(|_| serde_json::json!({ "tools": [] }));
+            Json(RpcResponse::success(request.id, value))
+        }
+        RPC_TOOLS_RESULT => {
+            let Some(params) = request.params.clone() else {
+                return Json(RpcResponse::failure(
+                    request.id,
+                    RpcError::invalid_request(),
+                ));
+            };
+            let params = match serde_json::from_value::<ToolResultParams>(params) {
+                Ok(params) => params,
+                Err(_) => {
+                    return Json(RpcResponse::failure(
+                        request.id,
+                        RpcError::invalid_request(),
+                    ));
+                }
+            };
+            match state.bridge.complete(params).await {
+                Ok(ack) => {
+                    let value = serde_json::to_value(ack).unwrap_or_else(|_| {
+                        serde_json::to_value(ToolResultAck { accepted: true })
+                            .expect("tool result ack serializes")
+                    });
                     Json(RpcResponse::success(request.id, value))
                 }
-                Err(e) => Json(RpcResponse::failure(
+                Err(error) => Json(RpcResponse::failure(
                     request.id,
-                    RpcError::internal_error(e.to_string()),
+                    RpcError::internal_error(error),
                 )),
             }
         }

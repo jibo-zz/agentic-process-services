@@ -1,7 +1,7 @@
 use agentic_protocol::{ChatMessage, SessionSummary, UiMessage, UiPart, UiRole};
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr,
-    EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement, sea_query::OnConflict,
+    ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait,
+    FromQueryResult, QueryFilter, QueryOrder, Statement, sea_query::OnConflict,
 };
 
 use crate::entity::{message, session};
@@ -116,8 +116,7 @@ pub async fn load_ui_messages(
     messages
         .iter()
         .map(|m| {
-            let parts: Vec<UiPart> =
-                serde_json::from_value(m.parts.clone()).unwrap_or_default();
+            let parts: Vec<UiPart> = serde_json::from_value(m.parts.clone()).unwrap_or_default();
             Ok(UiMessage {
                 role: if m.role == "user" {
                     UiRole::User

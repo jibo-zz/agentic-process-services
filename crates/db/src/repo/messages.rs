@@ -25,8 +25,8 @@ pub async fn insert(
         UiRole::User => "user",
         UiRole::Assistant => "assistant",
     };
-    let parts = serde_json::to_value(&ui_message.parts)
-        .map_err(|e| DbErr::Custom(e.to_string()))?;
+    let parts =
+        serde_json::to_value(&ui_message.parts).map_err(|e| DbErr::Custom(e.to_string()))?;
 
     message::ActiveModel {
         id: Set(Uuid::new_v4()),

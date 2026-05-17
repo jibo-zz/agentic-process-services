@@ -1,8 +1,8 @@
 use agentic_config::DEFAULT_SERVER_ADDR;
 use agentic_protocol::{
     CHAT_STREAM_PATH, ChatRequest, ChatStreamEvent, HealthResponse, RPC_HEALTH_CHECK, RPC_PATH,
-    RPC_SESSIONS_GET, RPC_SESSIONS_LIST, RpcError, RpcRequest, RpcResponse, SessionSummary,
-    UiMessage,
+    RPC_SESSIONS_GET, RPC_SESSIONS_LIST, RPC_TOOLS_LIST, RPC_TOOLS_RESULT, RpcError, RpcRequest,
+    RpcResponse, SessionSummary, ToolResultAck, ToolResultParams, ToolsListResponse, UiMessage,
 };
 use futures_util::{Stream, StreamExt, stream};
 use serde::de::DeserializeOwned;
@@ -11,6 +11,9 @@ use std::{error::Error, fmt};
 const RPC_HEALTH_ID: u64 = 1;
 const RPC_SESSIONS_LIST_ID: u64 = 2;
 const RPC_SESSIONS_GET_ID: u64 = 3;
+const RPC_TOOLS_RESULT_ID: u64 = 4;
+const RPC_TOOLS_LIST_ID: u64 = 5;
+const AGENTS_SERVER_URL_ENV: &str = "AGENTS_SERVER_URL";
 
 #[derive(Debug)]
 pub enum FetchError {
@@ -61,7 +64,9 @@ impl Fetcher {
     }
 
     pub fn local() -> Self {
-        Self::new(format!("http://{DEFAULT_SERVER_ADDR}"))
+        let base_url = std::env::var(AGENTS_SERVER_URL_ENV)
+            .unwrap_or_else(|_| format!("http://{DEFAULT_SERVER_ADDR}"));
+        Self::new(base_url)
     }
 
     pub fn base_url(&self) -> &str {
@@ -84,6 +89,23 @@ impl Fetcher {
                 .with_params(serde_json::json!({ "id": id })),
         )
         .await
+    }
+
+    pub async fn tools_result(
+        &self,
+        params: ToolResultParams,
+    ) -> Result<ToolResultAck, FetchError> {
+        self.rpc_call(
+            RpcRequest::method(RPC_TOOLS_RESULT_ID, RPC_TOOLS_RESULT).with_params(
+                serde_json::to_value(params).map_err(|e| FetchError::Decode(e.to_string()))?,
+            ),
+        )
+        .await
+    }
+
+    pub async fn tools_list(&self) -> Result<ToolsListResponse, FetchError> {
+        self.rpc_call(RpcRequest::method(RPC_TOOLS_LIST_ID, RPC_TOOLS_LIST))
+            .await
     }
 
     pub async fn chat_stream(

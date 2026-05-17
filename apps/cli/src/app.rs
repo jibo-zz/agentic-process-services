@@ -1,6 +1,17 @@
 use crate::sessions::Session;
-use agentic_protocol::{ChatStreamEvent, SessionSummary, ToolState, UiMessage, UiPart, UiRole};
+use agentic_protocol::{
+    ChatStreamEvent, SessionSummary, ToolDescriptor, ToolExecutionKind, ToolState, UiMessage,
+    UiPart, UiRole,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::collections::{BTreeSet, HashMap};
+
+#[derive(Clone, Debug)]
+pub struct PendingToolApproval {
+    pub invocation_id: String,
+    pub name: String,
+    pub input: serde_json::Value,
+}
 
 #[derive(Clone, Default, Eq, PartialEq)]
 pub enum Route {
@@ -8,6 +19,7 @@ pub enum Route {
     Home,
     Chat,
     Sessions,
+    Tools,
     Missing(String),
 }
 
@@ -17,9 +29,23 @@ impl Route {
             Self::Home => "home",
             Self::Chat => "chat",
             Self::Sessions => "sessions",
+            Self::Tools => "tools",
             Self::Missing(_) => "missing",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolAvailability {
+    Active,
+    MissingLocally,
+    MissingRemotely,
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolDashboardItem {
+    pub descriptor: ToolDescriptor,
+    pub availability: ToolAvailability,
 }
 
 #[derive(Default)]
@@ -111,12 +137,23 @@ pub struct App {
     pub active_session: Option<Session>,
     pub chat_stream: ChatStream,
     pub chat_scroll: u16,
+    pub stream_id: Option<String>,
+    pub stream_secret: Option<String>,
+    pub pending_tool_approval: Option<PendingToolApproval>,
+    approval_decision: Option<(PendingToolApproval, bool)>,
     // sessions list
     pub sessions_list: Vec<SessionSummary>,
     pub sessions_loaded: bool,
     pub sessions_cursor: usize,
     pub sessions_scroll: u16,
     pub sessions_open_pending: Option<String>,
+    // tools dashboard
+    pub tools: Vec<ToolDashboardItem>,
+    pub tools_loaded: bool,
+    pub tools_cursor: usize,
+    pub tools_input: String,
+    pub tools_input_focused: bool,
+    pub tools_notice: Option<String>,
 }
 
 impl App {
@@ -151,6 +188,10 @@ impl App {
     /// Called by tui.rs when it picks up the Pending state and spawns the task.
     pub fn start_chat_stream(&mut self) {
         if let ChatStream::Pending(user_msg) = std::mem::take(&mut self.chat_stream) {
+            self.stream_id = None;
+            self.stream_secret = None;
+            self.pending_tool_approval = None;
+            self.approval_decision = None;
             self.chat_stream = ChatStream::Streaming {
                 user_msg,
                 assistant: UiMessage::assistant(),
@@ -164,6 +205,13 @@ impl App {
         };
 
         match event {
+            ChatStreamEvent::StreamReady {
+                stream_id,
+                stream_secret,
+            } => {
+                self.stream_id = Some(stream_id);
+                self.stream_secret = Some(stream_secret);
+            }
             ChatStreamEvent::MessageStart { role } => {
                 if role == UiRole::Assistant && assistant.role != UiRole::Assistant {
                     assistant.role = UiRole::Assistant;
@@ -181,6 +229,28 @@ impl App {
             } => {
                 upsert_tool_part(assistant, id, name, state, input, output, error);
             }
+            ChatStreamEvent::LocalToolRequest {
+                invocation_id,
+                name,
+                input: _,
+                approval_required,
+                summary,
+            } => {
+                let state = if approval_required {
+                    ToolState::AwaitingApproval
+                } else {
+                    ToolState::Calling
+                };
+                upsert_tool_part(
+                    assistant,
+                    invocation_id,
+                    name,
+                    state,
+                    Some(serde_json::json!({ "summary": summary })),
+                    None,
+                    None,
+                );
+            }
             ChatStreamEvent::Error { message } => assistant.parts.push(UiPart::Error { message }),
             ChatStreamEvent::MessageDone => {}
         }
@@ -197,6 +267,10 @@ impl App {
             session.messages.push(UiMessage::user_text(user_msg));
             session.messages.push(assistant);
         }
+        self.stream_id = None;
+        self.stream_secret = None;
+        self.pending_tool_approval = None;
+        self.approval_decision = None;
     }
 
     pub fn set_chat_error(&mut self, error: impl Into<String>) {
@@ -219,6 +293,51 @@ impl App {
         self.chat_stream = ChatStream::Idle;
     }
 
+    pub fn set_pending_tool_approval(&mut self, approval: PendingToolApproval) {
+        self.pending_tool_approval = Some(approval);
+    }
+
+    pub fn has_pending_tool_approval(&self) -> bool {
+        self.pending_tool_approval.is_some()
+    }
+
+    pub fn take_tool_approval_decision(&mut self) -> Option<(PendingToolApproval, bool)> {
+        self.approval_decision.take()
+    }
+
+    pub fn local_tool_finished(
+        &mut self,
+        invocation_id: String,
+        name: String,
+        output: Option<serde_json::Value>,
+        error: Option<String>,
+    ) {
+        let state = if error.is_some() {
+            ToolState::Failed
+        } else {
+            ToolState::Complete
+        };
+        let ChatStream::Streaming { assistant, .. } = &mut self.chat_stream else {
+            return;
+        };
+        upsert_tool_part(assistant, invocation_id, name, state, None, output, error);
+    }
+
+    pub fn local_tool_started(&mut self, invocation_id: String, name: String) {
+        let ChatStream::Streaming { assistant, .. } = &mut self.chat_stream else {
+            return;
+        };
+        upsert_tool_part(
+            assistant,
+            invocation_id,
+            name,
+            ToolState::Calling,
+            None,
+            None,
+            None,
+        );
+    }
+
     pub fn text_area_key_bindings_hint(&self) -> String {
         let submit = key_binding_names(TextAreaAction::Submit).join("/");
         let newline = key_binding_names(TextAreaAction::InsertNewline).join("/");
@@ -232,8 +351,40 @@ impl App {
                 self.route = Route::Home;
                 false
             }
+            KeyCode::Esc if matches!(self.route, Route::Tools) && self.tools_input_focused => {
+                self.tools_input_focused = false;
+                false
+            }
+            KeyCode::Esc if matches!(self.route, Route::Tools) => {
+                self.route = Route::Home;
+                false
+            }
             KeyCode::Esc => true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
+
+            KeyCode::Char('y') | KeyCode::Char('Y') if self.has_pending_tool_approval() => {
+                if let Some(approval) = self.pending_tool_approval.take() {
+                    let invocation_id = approval.invocation_id.clone();
+                    let name = approval.name.clone();
+                    self.local_tool_started(invocation_id, name);
+                    self.approval_decision = Some((approval, true));
+                }
+                false
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') if self.has_pending_tool_approval() => {
+                if let Some(approval) = self.pending_tool_approval.take() {
+                    let invocation_id = approval.invocation_id.clone();
+                    let name = approval.name.clone();
+                    self.local_tool_finished(
+                        invocation_id,
+                        name,
+                        None,
+                        Some("User rejected the file operation".to_owned()),
+                    );
+                    self.approval_decision = Some((approval, false));
+                }
+                false
+            }
 
             // Sessions list navigation
             KeyCode::Up if matches!(self.route, Route::Sessions) => {
@@ -250,6 +401,36 @@ impl App {
                 false
             }
 
+            // Tools dashboard navigation and proposal input shell
+            KeyCode::Up if matches!(self.route, Route::Tools) && !self.tools_input_focused => {
+                self.tools_cursor = self.tools_cursor.saturating_sub(1);
+                false
+            }
+            KeyCode::Down if matches!(self.route, Route::Tools) && !self.tools_input_focused => {
+                let max = self.tools.len().saturating_sub(1);
+                self.tools_cursor = (self.tools_cursor + 1).min(max);
+                false
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') if matches!(self.route, Route::Tools) => {
+                self.tools_input_focused = true;
+                self.tools_notice = None;
+                false
+            }
+            KeyCode::Enter if matches!(self.route, Route::Tools) && self.tools_input_focused => {
+                self.submit_tool_request();
+                false
+            }
+            KeyCode::Backspace
+                if matches!(self.route, Route::Tools) && self.tools_input_focused =>
+            {
+                self.tools_input.pop();
+                false
+            }
+            KeyCode::Char(c) if matches!(self.route, Route::Tools) && self.tools_input_focused => {
+                self.tools_input.push(c);
+                false
+            }
+
             // Chat scroll
             KeyCode::Up if matches!(self.route, Route::Chat) => {
                 self.scroll_chat_up();
@@ -262,6 +443,7 @@ impl App {
 
             // Text input (only on routes that have an input box)
             _ if matches!(self.route, Route::Sessions) => false,
+            _ if matches!(self.route, Route::Tools) => false,
             _ if self.handle_text_area_key(key) => false,
             KeyCode::Char(c) => {
                 self.input.push(c);
@@ -337,9 +519,86 @@ impl App {
                 self.sessions_scroll = 0;
                 self.route = Route::Sessions;
             }
+            "tools" => {
+                self.tools_cursor = 0;
+                self.tools_input_focused = false;
+                self.route = Route::Tools;
+            }
             _ => self.route = Route::Missing(format!("/{command}")),
         }
         true
+    }
+
+    pub fn set_tools_from_server(&mut self, server_tools: Vec<ToolDescriptor>) {
+        let local_tools = agentic_tools::descriptors();
+        let server_by_name = server_tools
+            .into_iter()
+            .map(|tool| (tool.name.clone(), tool))
+            .collect::<HashMap<_, _>>();
+        let local_by_name = local_tools
+            .into_iter()
+            .map(|tool| (tool.name.clone(), tool))
+            .collect::<HashMap<_, _>>();
+        let names = server_by_name
+            .keys()
+            .chain(local_by_name.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+
+        self.tools = names
+            .into_iter()
+            .filter_map(|name| {
+                let server = server_by_name.get(&name);
+                let local = local_by_name.get(&name);
+                match (server, local) {
+                    (Some(server), Some(local)) => Some(ToolDashboardItem {
+                        descriptor: server.clone(),
+                        availability: if tool_contract_matches(server, local) {
+                            ToolAvailability::Active
+                        } else {
+                            ToolAvailability::MissingLocally
+                        },
+                    }),
+                    (Some(server), None) => Some(ToolDashboardItem {
+                        descriptor: server.clone(),
+                        availability: if server.execution == ToolExecutionKind::ServerNative {
+                            ToolAvailability::Active
+                        } else {
+                            ToolAvailability::MissingLocally
+                        },
+                    }),
+                    (None, Some(local)) => Some(ToolDashboardItem {
+                        descriptor: local.clone(),
+                        availability: ToolAvailability::MissingRemotely,
+                    }),
+                    (None, None) => None,
+                }
+            })
+            .collect();
+        self.tools_cursor = self.tools_cursor.min(self.tools.len().saturating_sub(1));
+        self.tools_loaded = true;
+    }
+
+    pub fn set_tools_error(&mut self, message: impl Into<String>) {
+        self.tools = agentic_tools::descriptors()
+            .into_iter()
+            .map(|descriptor| ToolDashboardItem {
+                descriptor,
+                availability: ToolAvailability::MissingRemotely,
+            })
+            .collect();
+        self.tools_loaded = true;
+        self.tools_notice = Some(message.into());
+    }
+
+    fn submit_tool_request(&mut self) {
+        let request = self.tools_input.trim();
+        if request.is_empty() {
+            return;
+        }
+        self.tools_notice = Some(format!("Tool proposal queued for a later phase: {request}"));
+        self.tools_input.clear();
+        self.tools_input_focused = false;
     }
 
     fn open_selected_session(&mut self) {
@@ -364,10 +623,21 @@ impl App {
             messages,
         });
         self.chat_stream = ChatStream::Idle;
+        self.stream_id = None;
+        self.stream_secret = None;
+        self.pending_tool_approval = None;
+        self.approval_decision = None;
         self.chat_scroll = u16::MAX;
         self.route = Route::Chat;
         self.sessions_open_pending = None;
     }
+}
+
+fn tool_contract_matches(server: &ToolDescriptor, local: &ToolDescriptor) -> bool {
+    server.execution == local.execution
+        && server.approval_required == local.approval_required
+        && server.risk == local.risk
+        && server.output_policy == local.output_policy
 }
 
 fn append_text_part(message: &mut UiMessage, text: String) {

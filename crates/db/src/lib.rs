@@ -23,8 +23,14 @@ async fn sync_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
     let schema = Schema::new(backend);
 
     let stmts: Vec<TableCreateStatement> = vec![
-        schema.create_table_from_entity(session::Entity).if_not_exists().to_owned(),
-        schema.create_table_from_entity(message::Entity).if_not_exists().to_owned(),
+        schema
+            .create_table_from_entity(session::Entity)
+            .if_not_exists()
+            .to_owned(),
+        schema
+            .create_table_from_entity(message::Entity)
+            .if_not_exists()
+            .to_owned(),
     ];
 
     for stmt in stmts {

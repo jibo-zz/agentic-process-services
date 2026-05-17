@@ -8,6 +8,8 @@ pub const RPC_HEALTH_CHECK: &str = "health.check";
 pub const RPC_LLM_GENERATE: &str = "llm.generate";
 pub const RPC_SESSIONS_LIST: &str = "sessions.list";
 pub const RPC_SESSIONS_GET: &str = "sessions.get";
+pub const RPC_TOOLS_LIST: &str = "tools.list";
+pub const RPC_TOOLS_RESULT: &str = "tools.result";
 pub const CHAT_STREAM_PATH: &str = "/chat/stream";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +31,49 @@ pub struct SessionSummary {
     pub updated_at_secs: u64,
     pub message_count: u64,
 }
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExecutionKind {
+    ServerNative,
+    LocalProxy,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRisk {
+    ReadOnly,
+    WritesFiles,
+    DeletesFiles,
+    DeletesDirectories,
+    Network,
+    ExternalProcess,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutputPolicy {
+    FullToModelSummaryToUi,
+    SummaryOnly,
+    FullAllowed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDescriptor {
+    pub name: String,
+    pub description: String,
+    pub execution: ToolExecutionKind,
+    pub approval_required: bool,
+    pub risk: ToolRisk,
+    pub output_policy: ToolOutputPolicy,
+    pub parameters: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolsListResponse {
+    pub tools: Vec<ToolDescriptor>,
+}
+
 pub const LLM_PREAMBLE: &str = "You are usful assistance.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,28 +105,51 @@ impl UiMessage {
                 if let Some(UiPart::Text { content }) = self.parts.last_mut() {
                     content.push_str(text);
                 } else {
-                    self.parts.push(UiPart::Text { content: text.clone() });
+                    self.parts.push(UiPart::Text {
+                        content: text.clone(),
+                    });
                 }
             }
             ChatStreamEvent::ReasoningDelta { text } => {
                 if let Some(UiPart::Reasoning { content }) = self.parts.last_mut() {
                     content.push_str(text);
                 } else {
-                    self.parts.push(UiPart::Reasoning { content: text.clone() });
+                    self.parts.push(UiPart::Reasoning {
+                        content: text.clone(),
+                    });
                 }
             }
-            ChatStreamEvent::ToolUpdate { id, name, state, input, output, error } => {
-                let pos = self.parts.iter().position(|p| {
-                    matches!(p, UiPart::Tool { id: tid, .. } if tid == id)
-                });
+            ChatStreamEvent::ToolUpdate {
+                id,
+                name,
+                state,
+                input,
+                output,
+                error,
+            } => {
+                let pos = self
+                    .parts
+                    .iter()
+                    .position(|p| matches!(p, UiPart::Tool { id: tid, .. } if tid == id));
                 if let Some(idx) = pos {
-                    if let UiPart::Tool { state: s, input: inp, output: out, error: err, .. } =
-                        &mut self.parts[idx]
+                    if let UiPart::Tool {
+                        state: s,
+                        input: inp,
+                        output: out,
+                        error: err,
+                        ..
+                    } = &mut self.parts[idx]
                     {
                         *s = *state;
-                        if input.is_some() { *inp = input.clone(); }
-                        if output.is_some() { *out = output.clone(); }
-                        if error.is_some() { *err = error.clone(); }
+                        if input.is_some() {
+                            *inp = input.clone();
+                        }
+                        if output.is_some() {
+                            *out = output.clone();
+                        }
+                        if error.is_some() {
+                            *err = error.clone();
+                        }
                     }
                 } else {
                     self.parts.push(UiPart::Tool {
@@ -94,10 +162,34 @@ impl UiMessage {
                     });
                 }
             }
-            ChatStreamEvent::Error { message } => {
-                self.parts.push(UiPart::Error { message: message.clone() });
+            ChatStreamEvent::LocalToolRequest {
+                invocation_id,
+                name,
+                approval_required,
+                summary,
+                ..
+            } => {
+                self.parts.push(UiPart::Tool {
+                    id: invocation_id.clone(),
+                    name: name.clone(),
+                    state: if *approval_required {
+                        ToolState::AwaitingApproval
+                    } else {
+                        ToolState::Calling
+                    },
+                    input: Some(serde_json::json!({ "summary": summary })),
+                    output: None,
+                    error: None,
+                });
             }
-            ChatStreamEvent::MessageStart { .. } | ChatStreamEvent::MessageDone => {}
+            ChatStreamEvent::Error { message } => {
+                self.parts.push(UiPart::Error {
+                    message: message.clone(),
+                });
+            }
+            ChatStreamEvent::StreamReady { .. }
+            | ChatStreamEvent::MessageStart { .. }
+            | ChatStreamEvent::MessageDone => {}
         }
     }
 }
@@ -147,6 +239,10 @@ pub enum ToolState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChatStreamEvent {
+    StreamReady {
+        stream_id: String,
+        stream_secret: String,
+    },
     MessageStart {
         role: UiRole,
     },
@@ -167,10 +263,33 @@ pub enum ChatStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    LocalToolRequest {
+        invocation_id: String,
+        name: String,
+        input: Value,
+        approval_required: bool,
+        summary: String,
+    },
     Error {
         message: String,
     },
     MessageDone,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResultParams {
+    pub stream_id: String,
+    pub stream_secret: String,
+    pub invocation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResultAck {
+    pub accepted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
