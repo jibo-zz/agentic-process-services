@@ -13,6 +13,87 @@ pub struct PendingToolApproval {
     pub input: serde_json::Value,
 }
 
+/// Single-buffer text input with a UTF-8 safe caret. Used for both the
+/// chat/home prompt and the tools proposal input.
+#[derive(Default, Clone)]
+pub struct TextField {
+    value: String,
+    caret: usize,
+}
+
+impl TextField {
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+    pub fn is_empty(&self) -> bool {
+        self.value.is_empty()
+    }
+    pub fn byte_len(&self) -> usize {
+        self.value.len()
+    }
+    pub fn caret_byte(&self) -> usize {
+        self.caret
+    }
+    pub fn clear(&mut self) {
+        self.value.clear();
+        self.caret = 0;
+    }
+    pub fn insert_char(&mut self, c: char) {
+        self.value.insert(self.caret, c);
+        self.caret += c.len_utf8();
+    }
+    pub fn backspace(&mut self) {
+        if let Some(prev) = self.prev_boundary() {
+            self.value.replace_range(prev..self.caret, "");
+            self.caret = prev;
+        }
+    }
+    pub fn delete_forward(&mut self) {
+        if let Some(next) = self.next_boundary() {
+            self.value.replace_range(self.caret..next, "");
+        }
+    }
+    pub fn move_left(&mut self) {
+        if let Some(prev) = self.prev_boundary() {
+            self.caret = prev;
+        }
+    }
+    pub fn move_right(&mut self) {
+        if let Some(next) = self.next_boundary() {
+            self.caret = next;
+        }
+    }
+    pub fn move_home(&mut self) {
+        let head = &self.value[..self.caret];
+        self.caret = head.rfind('\n').map_or(0, |i| i + 1);
+    }
+    pub fn move_end(&mut self) {
+        let tail = &self.value[self.caret..];
+        let off = tail.find('\n').unwrap_or(tail.len());
+        self.caret += off;
+    }
+    fn prev_boundary(&self) -> Option<usize> {
+        if self.caret == 0 {
+            return None;
+        }
+        let mut i = self.caret - 1;
+        while !self.value.is_char_boundary(i) {
+            i -= 1;
+        }
+        Some(i)
+    }
+    fn next_boundary(&self) -> Option<usize> {
+        if self.caret >= self.value.len() {
+            return None;
+        }
+        let mut i = self.caret + 1;
+        while i < self.value.len() && !self.value.is_char_boundary(i) {
+            i += 1;
+        }
+        Some(i)
+    }
+}
+
 #[derive(Clone, Default, Eq, PartialEq)]
 pub enum Route {
     #[default]
@@ -132,7 +213,7 @@ const TEXTAREA_KEY_BINDINGS: &[TextAreaKeyBinding] = &[
 #[derive(Default)]
 pub struct App {
     pub route: Route,
-    input: String,
+    input: TextField,
     // chat
     pub active_session: Option<Session>,
     pub chat_stream: ChatStream,
@@ -151,7 +232,7 @@ pub struct App {
     pub tools: Vec<ToolDashboardItem>,
     pub tools_loaded: bool,
     pub tools_cursor: usize,
-    pub tools_input: String,
+    pub tools_input: TextField,
     pub tools_input_focused: bool,
     pub tools_notice: Option<String>,
 }
@@ -161,10 +242,13 @@ impl App {
         &self.route
     }
     pub fn input(&self) -> &str {
-        &self.input
+        self.input.as_str()
     }
     pub fn input_len(&self) -> usize {
-        self.input.len()
+        self.input.byte_len()
+    }
+    pub fn input_caret(&self) -> usize {
+        self.input.caret_byte()
     }
     pub fn chat_stream(&self) -> &ChatStream {
         &self.chat_stream
@@ -411,7 +495,9 @@ impl App {
                 self.tools_cursor = (self.tools_cursor + 1).min(max);
                 false
             }
-            KeyCode::Char('n') | KeyCode::Char('N') if matches!(self.route, Route::Tools) => {
+            KeyCode::Char('n') | KeyCode::Char('N')
+                if matches!(self.route, Route::Tools) && !self.tools_input_focused =>
+            {
                 self.tools_input_focused = true;
                 self.tools_notice = None;
                 false
@@ -423,11 +509,33 @@ impl App {
             KeyCode::Backspace
                 if matches!(self.route, Route::Tools) && self.tools_input_focused =>
             {
-                self.tools_input.pop();
+                self.tools_input.backspace();
+                false
+            }
+            KeyCode::Delete
+                if matches!(self.route, Route::Tools) && self.tools_input_focused =>
+            {
+                self.tools_input.delete_forward();
+                false
+            }
+            KeyCode::Left if matches!(self.route, Route::Tools) && self.tools_input_focused => {
+                self.tools_input.move_left();
+                false
+            }
+            KeyCode::Right if matches!(self.route, Route::Tools) && self.tools_input_focused => {
+                self.tools_input.move_right();
+                false
+            }
+            KeyCode::Home if matches!(self.route, Route::Tools) && self.tools_input_focused => {
+                self.tools_input.move_home();
+                false
+            }
+            KeyCode::End if matches!(self.route, Route::Tools) && self.tools_input_focused => {
+                self.tools_input.move_end();
                 false
             }
             KeyCode::Char(c) if matches!(self.route, Route::Tools) && self.tools_input_focused => {
-                self.tools_input.push(c);
+                self.tools_input.insert_char(c);
                 false
             }
 
@@ -444,9 +552,29 @@ impl App {
             // Text input (only on routes that have an input box)
             _ if matches!(self.route, Route::Sessions) => false,
             _ if matches!(self.route, Route::Tools) => false,
+            KeyCode::Left => {
+                self.input.move_left();
+                false
+            }
+            KeyCode::Right => {
+                self.input.move_right();
+                false
+            }
+            KeyCode::Home => {
+                self.input.move_home();
+                false
+            }
+            KeyCode::End => {
+                self.input.move_end();
+                false
+            }
+            KeyCode::Delete => {
+                self.input.delete_forward();
+                false
+            }
             _ if self.handle_text_area_key(key) => false,
             KeyCode::Char(c) => {
-                self.input.push(c);
+                self.input.insert_char(c);
                 false
             }
             _ => false,
@@ -459,16 +587,14 @@ impl App {
         };
         match binding.action {
             TextAreaAction::Submit => self.submit_prompt(),
-            TextAreaAction::InsertNewline => self.input.push('\n'),
-            TextAreaAction::Backspace => {
-                self.input.pop();
-            }
+            TextAreaAction::InsertNewline => self.input.insert_char('\n'),
+            TextAreaAction::Backspace => self.input.backspace(),
         }
         true
     }
 
     fn submit_prompt(&mut self) {
-        let prompt = self.input.trim().to_owned();
+        let prompt = self.input.as_str().trim().to_owned();
         if prompt.is_empty() {
             return;
         }
@@ -592,7 +718,7 @@ impl App {
     }
 
     fn submit_tool_request(&mut self) {
-        let request = self.tools_input.trim();
+        let request = self.tools_input.as_str().trim().to_owned();
         if request.is_empty() {
             return;
         }

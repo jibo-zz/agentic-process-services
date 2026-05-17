@@ -51,7 +51,7 @@
 - Routes: `/home`, `/sessions`, `/tools`; unknown routes render Not Found.
 - `Enter` submits; `Ctrl+Enter` / `Alt+Enter` insert newlines.
 - Esc on Sessions and Tools returns Home; elsewhere it quits unless an inline input/approval consumes it.
-- Mouse capture is intentionally off so terminal-native selection and copy work. Use arrow keys for chat scrolling.
+- Mouse capture is intentionally off so terminal-native selection and copy work. Up/Down scroll the chat; Left/Right/Home/End/Delete edit the text-input caret.
 
 ## Environment And Commands
 - Server loads `apps/server/.env`; `DEEPSEEK_API_KEY` and `DATABASE_URL` are required for normal chat operation.

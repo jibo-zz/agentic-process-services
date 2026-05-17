@@ -1,7 +1,8 @@
 use crate::app::App;
 use ratatui::{
+    Frame,
     buffer::Buffer,
-    layout::{Alignment, Constraint, Flex, Layout, Rect},
+    layout::{Alignment, Constraint, Flex, Layout, Position, Rect},
     style::Style,
     style::Stylize,
     text::{Line, Text},
@@ -19,39 +20,31 @@ const WORDMARK_LINES: [&str; 6] = [
     "|_|  \\__,_|\\__,_||_|\\__,_|\\___/  ",
 ];
 
-pub struct HomeScreen<'a> {
-    app: &'a App,
-}
+pub fn render(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    frame.render_widget(Paragraph::new("").style(Style::new()), area);
 
-impl<'a> HomeScreen<'a> {
-    pub fn new(app: &'a App) -> Self {
-        Self { app }
-    }
-}
+    let home = centered_rect(area, 92, 26);
+    let [inner] = Layout::vertical([Constraint::Fill(1)])
+        .margin(1)
+        .areas(home);
 
-impl Widget for HomeScreen<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        Paragraph::new("").style(Style::new()).render(area, buf);
+    let landing = centered_rect(inner, inner.width.min(82), 17);
+    let [brand, prompt, footer] = Layout::vertical([
+        Constraint::Length(9),
+        Constraint::Length(7),
+        Constraint::Length(1),
+    ])
+    .spacing(1)
+    .areas(landing);
 
-        let home = centered_rect(area, 92, 26);
-        let [inner] = Layout::vertical([Constraint::Fill(1)])
-            .margin(1)
-            .areas(home);
+    frame.render_widget(LandingHeader, brand);
+    let input_inner = render_text_area(frame, app, prompt);
+    frame.render_widget(StatusFooter::new(app.input_len()), footer);
 
-        let landing = centered_rect(inner, inner.width.min(82), 17);
-        let [brand, prompt, footer] = Layout::vertical([
-            Constraint::Length(9),
-            Constraint::Length(7),
-            Constraint::Length(1),
-        ])
-        .spacing(1)
-        .areas(landing);
-
-        LandingHeader.render(brand, buf);
-        HomeTextArea::new(self.app.input(), self.app.text_area_key_bindings_hint())
-            .render(prompt, buf);
-        StatusFooter::new(self.app.input_len()).render(footer, buf);
-    }
+    let head = &app.input()[..app.input_caret()];
+    let (cx, cy) = super::caret_xy(head, input_inner.width);
+    frame.set_cursor_position(Position::new(input_inner.x + cx, input_inner.y + cy));
 }
 
 struct LandingHeader;
@@ -74,50 +67,36 @@ impl Widget for LandingHeader {
     }
 }
 
-struct HomeTextArea<'a> {
-    input: &'a str,
-    key_bindings_hint: String,
-}
+fn render_text_area(frame: &mut Frame, app: &App, area: Rect) -> Rect {
+    let input = app.input();
+    let text = if input.is_empty() {
+        Text::from(Line::from(PROMPT_PLACEHOLDER.dim()))
+    } else {
+        Text::from(
+            input
+                .split('\n')
+                .map(|line| Line::from(line.to_owned()).cyan())
+                .collect::<Vec<_>>(),
+        )
+    };
 
-impl<'a> HomeTextArea<'a> {
-    fn new(input: &'a str, key_bindings_hint: String) -> Self {
-        Self {
-            input,
-            key_bindings_hint,
-        }
-    }
-}
-
-impl Widget for HomeTextArea<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let text = if self.input.is_empty() {
-            Text::from(Line::from(PROMPT_PLACEHOLDER.dim()))
-        } else {
-            Text::from(
-                self.input
-                    .split('\n')
-                    .map(|line| Line::from(line.to_owned()).cyan())
-                    .collect::<Vec<_>>(),
-            )
-        };
-
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::bordered()
-                    .title_top(Line::from(vec!["  > ".green(), "Ask Faaido ".bold()]))
-                    .title_bottom(
-                        Line::from(format!(" {} ", self.key_bindings_hint))
-                            .right_aligned()
-                            .dim(),
-                    )
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::new().cyan())
-                    .padding(Padding::new(1, 1, 1, 0)),
-            )
-            .render(area, buf);
-    }
+    let block = Block::bordered()
+        .title_top(Line::from(vec!["  > ".green(), "Ask Faaido ".bold()]))
+        .title_bottom(
+            Line::from(format!(" {} ", app.text_area_key_bindings_hint()))
+                .right_aligned()
+                .dim(),
+        )
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().cyan())
+        .padding(Padding::new(1, 1, 1, 0));
+    let inner = block.inner(area);
+    frame.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: false }).block(block),
+        area,
+    );
+    inner
 }
 
 struct StatusFooter {

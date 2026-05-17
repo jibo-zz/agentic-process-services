@@ -10,7 +10,17 @@ use crossterm::{
 };
 use futures_util::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
-use std::{io, panic, sync::mpsc, time::Duration};
+use std::{
+    io::{self, Write},
+    panic,
+    sync::mpsc,
+    time::Duration,
+};
+
+// OSC 12 sets the terminal cursor color; OSC 112 resets to the user's
+// default. The hex matches ratatui's cyan accent used on focused borders.
+const CURSOR_COLOR_SET: &str = "\x1b]12;#00d7d7\x07";
+const CURSOR_COLOR_RESET: &str = "\x1b]112\x07";
 
 use crate::app::Route;
 use agentic_protocol::{
@@ -494,12 +504,17 @@ fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     // Mouse capture is intentionally OFF so users can select text natively
     // (drag-to-highlight + Cmd/Ctrl+C). Up/Down keys still scroll the chat.
     execute!(stdout, EnterAlternateScreen)?;
+    let _ = stdout.write_all(CURSOR_COLOR_SET.as_bytes());
+    let _ = stdout.flush();
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
 fn restore_terminal() -> Result<()> {
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(CURSOR_COLOR_RESET.as_bytes());
+    let _ = stdout.flush();
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    execute!(stdout, LeaveAlternateScreen)?;
     Ok(())
 }
 

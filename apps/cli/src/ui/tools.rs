@@ -1,8 +1,9 @@
 use crate::app::{App, ToolAvailability};
 use agentic_protocol::{ToolDescriptor, ToolExecutionKind, ToolOutputPolicy, ToolRisk};
 use ratatui::{
+    Frame,
     buffer::Buffer,
-    layout::{Alignment, Constraint, Flex, Layout, Rect},
+    layout::{Alignment, Constraint, Flex, Layout, Position, Rect},
     style::{Style, Stylize},
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Padding, Paragraph, Widget, Wrap},
@@ -10,36 +11,31 @@ use ratatui::{
 
 const TOOL_INPUT_PLACEHOLDER: &str = "Press N, then describe a tool to propose later...";
 
-pub struct ToolsScreen<'a> {
-    app: &'a App,
-}
+pub fn render(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    frame.render_widget(Paragraph::new("").style(Style::new()), area);
 
-impl<'a> ToolsScreen<'a> {
-    pub fn new(app: &'a App) -> Self {
-        Self { app }
-    }
-}
-
-impl Widget for ToolsScreen<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        Paragraph::new("").style(Style::new()).render(area, buf);
-
-        let page = centered_rect(area, 112, area.height.saturating_sub(2).max(18));
-        let [main, input, footer] = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Length(5),
-            Constraint::Length(1),
-        ])
+    let page = centered_rect(area, 112, area.height.saturating_sub(2).max(18));
+    let [main, input, footer] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(5),
+        Constraint::Length(1),
+    ])
+    .spacing(1)
+    .areas(page);
+    let [list, detail] = Layout::horizontal([Constraint::Percentage(62), Constraint::Fill(1)])
         .spacing(1)
-        .areas(page);
-        let [list, detail] = Layout::horizontal([Constraint::Percentage(62), Constraint::Fill(1)])
-            .spacing(1)
-            .areas(main);
+        .areas(main);
 
-        render_tool_list(self.app, list, buf);
-        render_tool_detail(self.app, detail, buf);
-        render_tool_input(self.app, input, buf);
-        render_footer(self.app, footer, buf);
+    render_tool_list(app, list, frame.buffer_mut());
+    render_tool_detail(app, detail, frame.buffer_mut());
+    let input_inner = render_tool_input(app, input, frame.buffer_mut());
+    render_footer(app, footer, frame.buffer_mut());
+
+    if app.tools_input_focused {
+        let head = &app.tools_input.as_str()[..app.tools_input.caret_byte()];
+        let (cx, cy) = super::caret_xy(head, input_inner.width);
+        frame.set_cursor_position(Position::new(input_inner.x + cx, input_inner.y + cy));
     }
 }
 
@@ -192,11 +188,11 @@ fn push_descriptor_lines(
     ]));
 }
 
-fn render_tool_input(app: &App, area: Rect, buf: &mut Buffer) {
+fn render_tool_input(app: &App, area: Rect, buf: &mut Buffer) -> Rect {
     let text = if app.tools_input.is_empty() {
         Text::from(Line::from(TOOL_INPUT_PLACEHOLDER.dim()))
     } else {
-        Text::from(Line::from(app.tools_input.clone().cyan()))
+        Text::from(Line::from(app.tools_input.as_str().to_owned().cyan()))
     };
     let border_style = if app.tools_input_focused {
         Style::new().cyan()
@@ -204,21 +200,22 @@ fn render_tool_input(app: &App, area: Rect, buf: &mut Buffer) {
         Style::new().dark_gray()
     };
 
+    let block = Block::bordered()
+        .title_top(Line::from(vec!["  + ".green(), "New Tool Request ".bold()]))
+        .title_bottom(
+            Line::from(" N: focus  Enter: queue  Esc: cancel/back ")
+                .right_aligned()
+                .dim(),
+        )
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .padding(Padding::new(1, 1, 1, 0));
+    let inner = block.inner(area);
     Paragraph::new(text)
         .wrap(Wrap { trim: false })
-        .block(
-            Block::bordered()
-                .title_top(Line::from(vec!["  + ".green(), "New Tool Request ".bold()]))
-                .title_bottom(
-                    Line::from(" N: focus  Enter: queue  Esc: cancel/back ")
-                        .right_aligned()
-                        .dim(),
-                )
-                .border_type(BorderType::Rounded)
-                .border_style(border_style)
-                .padding(Padding::new(1, 1, 1, 0)),
-        )
+        .block(block)
         .render(area, buf);
+    inner
 }
 
 fn render_footer(app: &App, area: Rect, buf: &mut Buffer) {

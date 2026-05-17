@@ -1,39 +1,33 @@
 use crate::app::{App, ChatStream};
 use agentic_protocol::{ToolState, UiMessage, UiPart, UiRole};
 use ratatui::{
+    Frame,
     buffer::Buffer,
-    layout::{Alignment, Constraint, Flex, Layout, Rect},
+    layout::{Alignment, Constraint, Flex, Layout, Position, Rect},
     style::{Style, Stylize},
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Padding, Paragraph, Widget, Wrap},
 };
 
-pub struct ChatScreen<'a> {
-    app: &'a mut App,
-}
+pub fn render(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+    frame.render_widget(Paragraph::new("").style(Style::new()), area);
 
-impl<'a> ChatScreen<'a> {
-    pub fn new(app: &'a mut App) -> Self {
-        Self { app }
-    }
-}
+    let page = centered_rect(area, 92, area.height.saturating_sub(2).max(10));
+    let [history, input, footer] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(3),
+        Constraint::Length(1),
+    ])
+    .spacing(1)
+    .areas(page);
 
-impl Widget for ChatScreen<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        Paragraph::new("").style(Style::new()).render(area, buf);
+    render_history(app, history, frame.buffer_mut());
+    let cursor_pos = render_input(app, input, frame.buffer_mut());
+    render_footer(footer, frame.buffer_mut());
 
-        let page = centered_rect(area, 92, area.height.saturating_sub(2).max(10));
-        let [history, input, footer] = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .spacing(1)
-        .areas(page);
-
-        render_history(self.app, history, buf);
-        render_input(self.app, input, buf);
-        render_footer(footer, buf);
+    if let Some(pos) = cursor_pos {
+        frame.set_cursor_position(pos);
     }
 }
 
@@ -267,7 +261,7 @@ fn tool_state_label(state: ToolState) -> &'static str {
     }
 }
 
-fn render_input(app: &App, area: Rect, buf: &mut Buffer) {
+fn render_input(app: &App, area: Rect, buf: &mut Buffer) -> Option<Position> {
     let is_busy = matches!(
         app.chat_stream,
         ChatStream::Streaming { .. } | ChatStream::Pending(_)
@@ -288,6 +282,18 @@ fn render_input(app: &App, area: Rect, buf: &mut Buffer) {
     Paragraph::new(text)
         .wrap(Wrap { trim: false })
         .render(area, buf);
+
+    if is_busy {
+        return None;
+    }
+    let head = &app.input()[..app.input_caret()];
+    let displayed_head: String = head
+        .split('\n')
+        .map(|line| format!("> {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (cx, cy) = super::caret_xy(&displayed_head, area.width);
+    Some(Position::new(area.x + cx, area.y + cy))
 }
 
 fn render_footer(area: Rect, buf: &mut Buffer) {
