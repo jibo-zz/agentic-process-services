@@ -1,12 +1,20 @@
 use crate::tool_bridge::{StreamAuth, ToolBridge};
-use agentic_protocol::{ChatStreamEvent, LocalToolScript, ToolScriptLanguage};
+use agentic_db::{DatabaseConnection, repo::tools as tool_repo};
+use agentic_protocol::{
+    ChatStreamEvent, LocalToolScript, SaveDraftParams, ToolRisk, ToolScriptLanguage, ToolTestCase,
+    ToolVersionRow,
+};
 use agentic_tools::{
     DELETE_DIRECTORY, DELETE_FILE, EDIT_FILE, LIST_FILES, READ_FILE, SEARCH_FILES, ToolExecution,
     WRITE_FILE,
 };
 use rig::{completion::ToolDefinition, tool::Tool};
 use serde::{Deserialize, Serialize};
-use std::{error::Error, fmt};
+use std::{
+    error::Error,
+    fmt,
+    sync::{Arc, Mutex},
+};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Default, Clone, Copy, Deserialize, Serialize)]
@@ -287,6 +295,282 @@ impl Tool for DynamicProxyTool {
                 },
             )
             .await
+    }
+}
+
+/// Per-request state for the tool author agent. Holds the in-flight draft and, once the agent
+/// calls `submit_tool`, the persisted version row that the handler emits as `AuthorDone`.
+#[derive(Debug, Default)]
+pub struct AuthorState {
+    pub draft: Option<(ToolScriptLanguage, String)>,
+    pub submitted: Option<ToolVersionRow>,
+    pub submitted_name: Option<String>,
+    pub submitted_description: Option<String>,
+    pub run_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthorContext {
+    bridge: ToolBridge,
+    auth: StreamAuth,
+    events: mpsc::UnboundedSender<ChatStreamEvent>,
+    db: DatabaseConnection,
+    state: Arc<Mutex<AuthorState>>,
+}
+
+impl AuthorContext {
+    pub fn new(
+        bridge: ToolBridge,
+        auth: StreamAuth,
+        events: mpsc::UnboundedSender<ChatStreamEvent>,
+        db: DatabaseConnection,
+    ) -> Self {
+        Self {
+            bridge,
+            auth,
+            events,
+            db,
+            state: Arc::new(Mutex::new(AuthorState::default())),
+        }
+    }
+
+    pub fn state(&self) -> Arc<Mutex<AuthorState>> {
+        self.state.clone()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetDraftArgs {
+    pub language: ToolScriptLanguage,
+    pub script: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SetDraftOutput {
+    pub ok: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SetDraftTool {
+    context: AuthorContext,
+}
+
+impl SetDraftTool {
+    pub fn new(context: AuthorContext) -> Self {
+        Self { context }
+    }
+}
+
+impl Tool for SetDraftTool {
+    const NAME: &'static str = "set_draft";
+    type Error = ProxyToolError;
+    type Args = SetDraftArgs;
+    type Output = SetDraftOutput;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_owned(),
+            description: "Register the current candidate script as the active draft. Call this before sandbox_run and whenever you revise the script.".to_owned(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "language": { "type": "string", "enum": ["python", "shell"] },
+                    "script": { "type": "string", "description": "Full script body. Reads ARGS_JSON env var and prints JSON to stdout." }
+                },
+                "required": ["language", "script"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let mut state = self.context.state.lock().map_err(|_| ProxyToolError {
+            message: "author state poisoned".to_owned(),
+        })?;
+        state.draft = Some((args.language, args.script));
+        Ok(SetDraftOutput {
+            ok: true,
+            message: "Draft registered. You can now sandbox_run it.".to_owned(),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SandboxRunArgs {
+    pub args_json: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SandboxRunTool {
+    context: AuthorContext,
+}
+
+impl SandboxRunTool {
+    pub fn new(context: AuthorContext) -> Self {
+        Self { context }
+    }
+}
+
+impl Tool for SandboxRunTool {
+    const NAME: &'static str = "sandbox_run";
+    type Error = ProxyToolError;
+    type Args = SandboxRunArgs;
+    type Output = serde_json::Value;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_owned(),
+            description: "Execute the current draft script in the CLI sandbox with the given JSON args. Returns the run outcome (stdout, stderr, exit_code, duration_ms, timed_out). Call this once per test case to verify the script.".to_owned(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "args_json": { "type": "string", "description": "A JSON object passed to the script as ARGS_JSON env var." }
+                },
+                "required": ["args_json"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let (language, script) = {
+            let mut state = self.context.state.lock().map_err(|_| ProxyToolError {
+                message: "author state poisoned".to_owned(),
+            })?;
+            let Some((language, script)) = state.draft.clone() else {
+                return Err(ProxyToolError {
+                    message: "no draft registered; call set_draft first".to_owned(),
+                });
+            };
+            state.run_count += 1;
+            (language, script)
+        };
+        let input: serde_json::Value = serde_json::from_str(&args.args_json)
+            .unwrap_or_else(|_| serde_json::Value::String(args.args_json.clone()));
+        self.context
+            .bridge
+            .request_local_tool(
+                &self.context.auth,
+                &self.context.events,
+                "sandbox_run".to_owned(),
+                input,
+                false,
+                "Sandbox run".to_owned(),
+                Some(LocalToolScript {
+                    language,
+                    script,
+                    timeout_ms: 10_000,
+                }),
+            )
+            .await
+            .map_err(|error| ProxyToolError {
+                message: error.to_string(),
+            })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SubmitToolArgs {
+    pub name: String,
+    pub description: String,
+    pub args_schema: serde_json::Value,
+    #[serde(default)]
+    pub tests: Vec<ToolTestCase>,
+    #[serde(default)]
+    pub output_schema: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SubmitToolOutput {
+    pub version_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubmitToolTool {
+    context: AuthorContext,
+}
+
+impl SubmitToolTool {
+    pub fn new(context: AuthorContext) -> Self {
+        Self { context }
+    }
+}
+
+impl Tool for SubmitToolTool {
+    const NAME: &'static str = "submit_tool";
+    type Error = ProxyToolError;
+    type Args = SubmitToolArgs;
+    type Output = SubmitToolOutput;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_owned(),
+            description: "Persist the verified script as a Tier-2 draft tool. Call this exactly once, after all sandbox_run test cases have been attempted. Ends the author loop.".to_owned(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Snake_case tool name (e.g. json_to_yaml)." },
+                    "description": { "type": "string" },
+                    "args_schema": { "type": "object", "description": "JSON Schema for the args object the tool accepts." },
+                    "tests": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "args": {},
+                                "expected_stdout": { "type": "string" },
+                                "expected_exit": { "type": "integer" },
+                                "expected_contains": { "type": "string" }
+                            }
+                        }
+                    },
+                    "output_schema": { "type": "object" }
+                },
+                "required": ["name", "description", "args_schema"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let (language, script) = {
+            let state = self.context.state.lock().map_err(|_| ProxyToolError {
+                message: "author state poisoned".to_owned(),
+            })?;
+            state.draft.clone().ok_or_else(|| ProxyToolError {
+                message: "no draft registered; call set_draft first".to_owned(),
+            })?
+        };
+        let params = SaveDraftParams {
+            name: args.name.clone(),
+            description: args.description.clone(),
+            language,
+            script,
+            args_schema: args.args_schema.clone(),
+            output_schema: args.output_schema,
+            tests: args.tests,
+            risk: ToolRisk::ReadOnly,
+            timeout_ms: 10_000,
+            owner: "tool_author".to_owned(),
+        };
+        let row = tool_repo::save_draft(&self.context.db, params)
+            .await
+            .map_err(|error| ProxyToolError {
+                message: format!("save_draft failed: {error}"),
+            })?;
+        let version_id = row.id.clone();
+        {
+            let mut state = self.context.state.lock().map_err(|_| ProxyToolError {
+                message: "author state poisoned".to_owned(),
+            })?;
+            state.submitted = Some(row);
+            state.submitted_name = Some(args.name);
+            state.submitted_description = Some(args.description);
+        }
+        Ok(SubmitToolOutput {
+            version_id: version_id.clone(),
+            message: format!("Submitted as draft {version_id}. The user will review and publish."),
+        })
     }
 }
 

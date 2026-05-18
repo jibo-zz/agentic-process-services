@@ -14,7 +14,9 @@ pub const RPC_TOOLS_MANAGEMENT: &str = "tools.management";
 pub const RPC_TOOLS_SAVE_DRAFT: &str = "tools.save_draft";
 pub const RPC_TOOLS_REGISTER: &str = "tools.register";
 pub const RPC_TOOLS_DELETE_VERSION: &str = "tools.delete_version";
+pub const RPC_TOOLS_DELETE_TOOL: &str = "tools.delete_tool";
 pub const CHAT_STREAM_PATH: &str = "/chat/stream";
+pub const AUTHOR_STREAM_PATH: &str = "/author/stream";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -26,6 +28,15 @@ pub struct ChatMessage {
 pub struct ChatRequest {
     pub session_id: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorRequest {
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +202,7 @@ impl UiMessage {
             }
             ChatStreamEvent::StreamReady { .. }
             | ChatStreamEvent::MessageStart { .. }
+            | ChatStreamEvent::AuthorDone { .. }
             | ChatStreamEvent::MessageDone => {}
         }
     }
@@ -276,6 +288,16 @@ pub enum ChatStreamEvent {
     },
     Error {
         message: String,
+    },
+    AuthorDone {
+        version_id: String,
+        name: String,
+        language: ToolScriptLanguage,
+        script: String,
+        args_schema: Value,
+        #[serde(default)]
+        tests: Vec<ToolTestCase>,
+        description: String,
     },
     MessageDone,
 }
@@ -377,6 +399,11 @@ pub struct RegisterParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteVersionParams {
     pub version_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteToolParams {
+    pub tool_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

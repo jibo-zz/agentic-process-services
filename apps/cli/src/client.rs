@@ -1,7 +1,8 @@
 use agentic_config::DEFAULT_SERVER_ADDR;
 use agentic_protocol::{
-    CHAT_STREAM_PATH, ChatRequest, ChatStreamEvent, DeleteAck, DeleteVersionParams, HealthResponse,
-    RPC_HEALTH_CHECK, RPC_PATH, RPC_SESSIONS_GET, RPC_SESSIONS_LIST, RPC_TOOLS_DELETE_VERSION,
+    AUTHOR_STREAM_PATH, AuthorRequest, CHAT_STREAM_PATH, ChatRequest, ChatStreamEvent, DeleteAck,
+    DeleteToolParams, DeleteVersionParams, HealthResponse, RPC_HEALTH_CHECK, RPC_PATH,
+    RPC_SESSIONS_GET, RPC_SESSIONS_LIST, RPC_TOOLS_DELETE_TOOL, RPC_TOOLS_DELETE_VERSION,
     RPC_TOOLS_LIST, RPC_TOOLS_MANAGEMENT, RPC_TOOLS_REGISTER, RPC_TOOLS_RESULT,
     RPC_TOOLS_SAVE_DRAFT, RegisterParams, RpcError, RpcRequest, RpcResponse, SaveDraftParams,
     SessionSummary, ToolResultAck, ToolResultParams, ToolVersionRow, ToolsListResponse,
@@ -20,6 +21,7 @@ const RPC_TOOLS_MANAGEMENT_ID: u64 = 6;
 const RPC_TOOLS_SAVE_DRAFT_ID: u64 = 7;
 const RPC_TOOLS_REGISTER_ID: u64 = 8;
 const RPC_TOOLS_DELETE_VERSION_ID: u64 = 9;
+const RPC_TOOLS_DELETE_TOOL_ID: u64 = 10;
 const AGENTS_SERVER_URL_ENV: &str = "AGENTS_SERVER_URL";
 
 #[derive(Debug)]
@@ -155,6 +157,34 @@ impl Fetcher {
         .await
     }
 
+    pub async fn tools_delete_tool(&self, tool_id: String) -> Result<DeleteAck, FetchError> {
+        self.rpc_call(
+            RpcRequest::method(RPC_TOOLS_DELETE_TOOL_ID, RPC_TOOLS_DELETE_TOOL).with_params(
+                serde_json::to_value(DeleteToolParams { tool_id })
+                    .map_err(|e| FetchError::Decode(e.to_string()))?,
+            ),
+        )
+        .await
+    }
+
+    pub async fn author_stream(
+        &self,
+        req: AuthorRequest,
+    ) -> Result<impl Stream<Item = Result<ChatStreamEvent, FetchError>>, FetchError> {
+        let response = self
+            .http
+            .post(format!("{}{AUTHOR_STREAM_PATH}", self.base_url))
+            .json(&req)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(FetchError::Decode(format!("HTTP {status}: {body}")));
+        }
+        Ok(sse_event_stream(response.bytes_stream()))
+    }
+
     pub async fn chat_stream(
         &self,
         session_id: &str,
@@ -176,40 +206,7 @@ impl Fetcher {
             return Err(FetchError::Decode(format!("HTTP {status}: {body}")));
         }
 
-        let bytes_stream = response.bytes_stream();
-
-        Ok(stream::unfold(
-            (bytes_stream, String::new()),
-            |(mut bytes_stream, mut buf)| async move {
-                loop {
-                    if let Some(pos) = buf.find("\n\n") {
-                        let event = buf[..pos].to_string();
-                        buf.drain(..pos + 2);
-                        for line in event.lines() {
-                            if let Some(json) = line.strip_prefix("data: ") {
-                                match serde_json::from_str::<ChatStreamEvent>(json) {
-                                    Ok(event) => return Some((Ok(event), (bytes_stream, buf))),
-                                    Err(e) => {
-                                        return Some((
-                                            Err(FetchError::Decode(e.to_string())),
-                                            (bytes_stream, buf),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    match bytes_stream.next().await {
-                        None => return None,
-                        Some(Err(e)) => {
-                            return Some((Err(FetchError::Http(e)), (bytes_stream, buf)));
-                        }
-                        Some(Ok(bytes)) => buf.push_str(&String::from_utf8_lossy(&bytes)),
-                    }
-                }
-            },
-        ))
+        Ok(sse_event_stream(response.bytes_stream()))
     }
 
     async fn rpc_call<T>(&self, req: RpcRequest) -> Result<T, FetchError>
@@ -232,4 +229,43 @@ impl Fetcher {
 
         response.result.ok_or(FetchError::MissingResult)
     }
+}
+
+fn sse_event_stream<S, B>(bytes: S) -> impl Stream<Item = Result<ChatStreamEvent, FetchError>>
+where
+    S: Stream<Item = reqwest::Result<B>> + Unpin,
+    B: AsRef<[u8]>,
+{
+    stream::unfold(
+        (bytes, String::new()),
+        |(mut bytes_stream, mut buf)| async move {
+            loop {
+                if let Some(pos) = buf.find("\n\n") {
+                    let event = buf[..pos].to_string();
+                    buf.drain(..pos + 2);
+                    for line in event.lines() {
+                        if let Some(json) = line.strip_prefix("data: ") {
+                            match serde_json::from_str::<ChatStreamEvent>(json) {
+                                Ok(event) => return Some((Ok(event), (bytes_stream, buf))),
+                                Err(e) => {
+                                    return Some((
+                                        Err(FetchError::Decode(e.to_string())),
+                                        (bytes_stream, buf),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                match bytes_stream.next().await {
+                    None => return None,
+                    Some(Err(e)) => {
+                        return Some((Err(FetchError::Http(e)), (bytes_stream, buf)));
+                    }
+                    Some(Ok(b)) => buf.push_str(&String::from_utf8_lossy(b.as_ref())),
+                }
+            }
+        },
+    )
 }

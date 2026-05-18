@@ -184,6 +184,28 @@ pub async fn register_active(
     Ok(to_version_row(&promoted))
 }
 
+/// Deletes a tool and every version it has ever had, atomically. Returns false if the tool id
+/// did not match any row. Use this for "remove this tool entirely" — for surgical version
+/// removal that preserves history, use `delete_version`.
+pub async fn delete_tool(db: &DatabaseConnection, tool_id: Uuid) -> Result<bool, DbErr> {
+    let txn = db.begin().await?;
+    let Some(_existing) = tool::Entity::find_by_id(tool_id).one(&txn).await? else {
+        return Ok(false);
+    };
+    tool::Entity::update_many()
+        .col_expr(tool::Column::CurrentVersionId, None::<Uuid>.into())
+        .filter(tool::Column::Id.eq(tool_id))
+        .exec(&txn)
+        .await?;
+    tool_version::Entity::delete_many()
+        .filter(tool_version::Column::ToolId.eq(tool_id))
+        .exec(&txn)
+        .await?;
+    tool::Entity::delete_by_id(tool_id).exec(&txn).await?;
+    txn.commit().await?;
+    Ok(true)
+}
+
 /// Deletes a non-active version. Refuses to delete the version currently pointed at by the
 /// parent tool. The parent row is removed if no versions remain.
 pub async fn delete_version(db: &DatabaseConnection, version_id: Uuid) -> Result<bool, DbErr> {

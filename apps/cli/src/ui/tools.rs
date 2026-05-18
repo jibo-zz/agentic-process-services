@@ -1,5 +1,6 @@
 use crate::app::{
-    App, ToolAvailability, ToolEditor, ToolEditorField, ToolEditorResult, ToolEditorResultKind,
+    App, GenerationState, ToolAvailability, ToolEditor, ToolEditorField, ToolEditorResult,
+    ToolEditorResultKind,
 };
 use agentic_protocol::{ToolDescriptor, ToolExecutionKind, ToolOutputPolicy, ToolRisk};
 use ratatui::{
@@ -23,6 +24,47 @@ pub fn render(frame: &mut Frame, app: &App) {
     } else {
         render_list_layout(frame, app, page);
     }
+
+    if let Some(target) = &app.pending_tool_delete {
+        render_delete_confirm(frame, area, target);
+    }
+}
+
+fn render_delete_confirm(frame: &mut Frame, area: Rect, target: &crate::app::PendingToolDelete) {
+    let popup = centered_rect(area, 70, 7);
+    // clear underneath so the popup is readable on top of the table
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    let kind = if target.is_draft { "draft" } else { "tool" };
+    let body = vec![
+        Line::from(""),
+        Line::from(vec![
+            "Delete ".into(),
+            kind.dim(),
+            " ".into(),
+            target.name.clone().bold().red(),
+            "?".into(),
+        ])
+        .centered(),
+        Line::from(""),
+        Line::from(vec![
+            "[".dim(),
+            "Y".bold().green(),
+            "] confirm   [".dim(),
+            "N".bold().magenta(),
+            "] / ".dim(),
+            "Esc".bold().magenta(),
+            " cancel".dim(),
+        ])
+        .centered(),
+    ];
+    Paragraph::new(Text::from(body))
+        .block(
+            Block::bordered()
+                .title_top(Line::from(" Confirm Delete ".bold().red()).centered())
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().red()),
+        )
+        .render(popup, frame.buffer_mut());
 }
 
 fn render_list_layout(frame: &mut Frame, app: &App, page: Rect) {
@@ -49,10 +91,10 @@ fn render_editor_layout(frame: &mut Frame, app: &App, page: Rect) {
         .spacing(1)
         .areas(main);
 
-    let script_cursor = render_editor(app, editor, frame.buffer_mut());
+    let editor_cursor = render_editor(app, editor, frame.buffer_mut());
     render_editor_results(app, results, frame.buffer_mut());
     render_footer(app, footer, frame.buffer_mut(), true);
-    if let Some((x, y)) = script_cursor {
+    if let Some((x, y)) = editor_cursor {
         frame.set_cursor_position(Position::new(x, y));
     }
 }
@@ -226,24 +268,77 @@ fn render_tool_placeholder(_app: &App, area: Rect, buf: &mut Buffer) {
 
 fn render_editor(app: &App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
     let editor = &app.tool_editor;
-    let title_lang = format!(" lang: {} ", editor.language.label());
+    let stage_label = match editor.generation {
+        GenerationState::Idle => " stage: describe ",
+        GenerationState::Generating => " stage: generating ",
+        GenerationState::Generated => " stage: review ",
+        GenerationState::Failed(_) => " stage: failed ",
+    };
+    let title_bottom = match editor.generation {
+        GenerationState::Generated => {
+            " Tab: focus  F2: lang  Ctrl+R: run  Ctrl+S: save  Ctrl+P: publish  Esc: back "
+        }
+        _ => " Tab: focus  Ctrl+G: generate  Esc: back ",
+    };
     let block = Block::bordered()
         .title_top(Line::from(vec![
             "  ".into(),
             "Tool Editor".bold().cyan(),
-            title_lang.green(),
+            stage_label.green(),
+            format!("lang: {} ", editor.language.label()).dim(),
         ]))
-        .title_bottom(
-            Line::from(" Tab/Shift+Tab: focus  F2: lang  Ctrl+R: run  Ctrl+S: save  Ctrl+P: publish  Esc: back ")
-                .right_aligned()
-                .dim(),
-        )
+        .title_bottom(Line::from(title_bottom).right_aligned().dim())
         .border_type(BorderType::Rounded)
         .border_style(Style::new().cyan())
         .padding(Padding::new(1, 1, 1, 0));
     let inner = block.inner(area);
     block.render(area, buf);
 
+    match editor.generation {
+        GenerationState::Generated => render_editor_review(buf, inner, editor),
+        _ => render_editor_describe(buf, inner, editor),
+    }
+}
+
+fn render_editor_describe(
+    buf: &mut Buffer,
+    inner: Rect,
+    editor: &ToolEditor,
+) -> Option<(u16, u16)> {
+    let [desc_row, input_row, output_row] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(3),
+        Constraint::Length(3),
+    ])
+    .spacing(1)
+    .areas(inner);
+
+    let desc_cursor = render_description_field(
+        buf,
+        desc_row,
+        editor,
+        matches!(editor.field, Some(ToolEditorField::Description)),
+    );
+    let input_cursor = render_field(
+        buf,
+        input_row,
+        "Input hint (optional)",
+        &editor.input_hint,
+        matches!(editor.field, Some(ToolEditorField::InputHint)),
+        "e.g. {url: string} — what the tool's args object should look like",
+    );
+    let output_cursor = render_field(
+        buf,
+        output_row,
+        "Output hint (optional)",
+        &editor.output_hint,
+        matches!(editor.field, Some(ToolEditorField::OutputHint)),
+        "e.g. {status: number, body: string} — what the script should print",
+    );
+    desc_cursor.or(input_cursor).or(output_cursor)
+}
+
+fn render_editor_review(buf: &mut Buffer, inner: Rect, editor: &ToolEditor) -> Option<(u16, u16)> {
     let [name_row, script_row, args_row] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Fill(1),
@@ -252,59 +347,119 @@ fn render_editor(app: &App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> 
     .spacing(1)
     .areas(inner);
 
-    render_field(
+    let name_cursor = render_field(
         buf,
         name_row,
         "Name",
-        editor.name.as_str(),
+        &editor.name,
         matches!(editor.field, Some(ToolEditorField::Name)),
         "(unique tool name, e.g. fetch_status)",
     );
-    let script_focused = matches!(editor.field, Some(ToolEditorField::Script));
-    let script_cursor = render_script_field(buf, script_row, editor, script_focused);
-    render_field(
+    let script_cursor = render_script_field(
+        buf,
+        script_row,
+        editor,
+        matches!(editor.field, Some(ToolEditorField::Script)),
+    );
+    let args_cursor = render_field(
         buf,
         args_row,
         "ARGS_JSON (run-input)",
-        editor.args.as_str(),
+        &editor.args,
         matches!(editor.field, Some(ToolEditorField::Args)),
         "JSON passed to the script as ARGS_JSON env var",
     );
+    name_cursor.or(script_cursor).or(args_cursor)
+}
 
-    script_cursor
+fn render_description_field(
+    buf: &mut Buffer,
+    area: Rect,
+    editor: &ToolEditor,
+    focused: bool,
+) -> Option<(u16, u16)> {
+    let border_style = if focused {
+        Style::new().cyan()
+    } else {
+        Style::new().dark_gray()
+    };
+    let value = editor.description.as_str();
+    let block = Block::bordered()
+        .title_top(Line::from(vec![
+            " ".into(),
+            "Describe the tool".bold().green(),
+            " ".into(),
+        ]))
+        .title_bottom(Line::from(" Ctrl+G to generate ").right_aligned().dim())
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .padding(Padding::new(1, 1, 0, 0));
+    let inner = block.inner(area);
+    let body: Text = if value.is_empty() {
+        Text::from(
+            super::wrap_chars(
+                "Describe the tool: what should it do? The model will pick python or shell, write the script, and verify it. Press Ctrl+G to generate.",
+                inner.width,
+            )
+            .into_iter()
+            .map(|line| Line::from(line.dim()))
+            .collect::<Vec<_>>(),
+        )
+    } else {
+        Text::from(
+            super::wrap_chars(value, inner.width)
+                .into_iter()
+                .map(Line::from)
+                .collect::<Vec<_>>(),
+        )
+    };
+    Paragraph::new(body).block(block).render(area, buf);
+    if focused {
+        let head = &value[..editor.description.caret_byte()];
+        let (cx, cy) = super::caret_xy(head, inner.width);
+        Some((inner.x + cx, inner.y + cy))
+    } else {
+        None
+    }
 }
 
 fn render_field(
     buf: &mut Buffer,
     area: Rect,
     label: &str,
-    value: &str,
+    field: &crate::app::TextField,
     focused: bool,
     placeholder: &str,
-) {
+) -> Option<(u16, u16)> {
     let border_style = if focused {
         Style::new().cyan()
     } else {
         Style::new().dark_gray()
     };
+    let value = field.as_str();
+    let block = Block::bordered()
+        .title_top(Line::from(vec![
+            " ".into(),
+            label.bold().green(),
+            " ".into(),
+        ]))
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .padding(Padding::new(1, 1, 0, 0));
+    let inner = block.inner(area);
     let content_text: Text = if value.is_empty() {
         Text::from(Line::from(placeholder.dim()))
     } else {
         Text::from(Line::from(value.to_owned()))
     };
-    Paragraph::new(content_text)
-        .block(
-            Block::bordered()
-                .title_top(Line::from(vec![
-                    " ".into(),
-                    label.bold().green(),
-                    " ".into(),
-                ]))
-                .border_type(BorderType::Rounded)
-                .border_style(border_style)
-                .padding(Padding::new(1, 1, 0, 0)),
-        )
-        .render(area, buf);
+    Paragraph::new(content_text).block(block).render(area, buf);
+    if focused {
+        let head = &value[..field.caret_byte()];
+        let (cx, cy) = super::caret_xy(head, inner.width);
+        Some((inner.x + cx, inner.y + cy))
+    } else {
+        None
+    }
 }
 
 fn render_script_field(
@@ -319,17 +474,6 @@ fn render_script_field(
         Style::new().dark_gray()
     };
     let value = editor.script.as_str();
-    let body: Text = if value.is_empty() {
-        Text::from(Line::from(
-            "# Write your script here. Read input via env ARGS_JSON.".dim(),
-        ))
-    } else {
-        let lines: Vec<Line> = value
-            .split('\n')
-            .map(|line| Line::from(line.to_owned()))
-            .collect();
-        Text::from(lines)
-    };
     let block = Block::bordered()
         .title_top(Line::from(vec![
             " ".into(),
@@ -345,10 +489,25 @@ fn render_script_field(
         .border_style(border_style)
         .padding(Padding::new(1, 1, 0, 0));
     let inner = block.inner(area);
-    Paragraph::new(body)
-        .wrap(Wrap { trim: false })
-        .block(block)
-        .render(area, buf);
+    let body: Text = if value.is_empty() {
+        Text::from(
+            super::wrap_chars(
+                "# Write your script here. Read input via env ARGS_JSON.",
+                inner.width,
+            )
+            .into_iter()
+            .map(|line| Line::from(line.dim()))
+            .collect::<Vec<_>>(),
+        )
+    } else {
+        Text::from(
+            super::wrap_chars(value, inner.width)
+                .into_iter()
+                .map(Line::from)
+                .collect::<Vec<_>>(),
+        )
+    };
+    Paragraph::new(body).block(block).render(area, buf);
 
     if focused {
         let head = &value[..editor.script.caret_byte()];
@@ -361,20 +520,57 @@ fn render_script_field(
 
 fn render_editor_results(app: &App, area: Rect, buf: &mut Buffer) {
     let mut lines: Vec<Line> = Vec::new();
-    if let Some(draft) = &app.tool_editor.last_draft_version_id {
-        lines.push(Line::from(vec![
-            "last draft > ".green(),
-            draft.clone().dim(),
-        ]));
-        lines.push(Line::from(""));
-    }
-    match &app.tool_editor.last_result {
-        None => {
+    let title = match app.tool_editor.generation {
+        GenerationState::Generating => "Generation Log",
+        GenerationState::Failed(_) => "Generation Failed",
+        GenerationState::Generated => "Review",
+        GenerationState::Idle => "Results",
+    };
+
+    match &app.tool_editor.generation {
+        GenerationState::Idle => {
             lines.push(Line::from(
-                "No run yet. Press Ctrl+R to run with current ARGS_JSON.".dim(),
+                "Type a description on the left and press Ctrl+G to generate.".dim(),
             ));
         }
-        Some(result) => push_result_lines(result, &mut lines),
+        GenerationState::Generating => {
+            for entry in &app.tool_editor.generation_log {
+                lines.push(Line::from(entry.clone().dim()));
+            }
+            if app.tool_editor.generation_log.is_empty() {
+                lines.push(Line::from("Waiting for first agent event...".dim()));
+            }
+        }
+        GenerationState::Failed(reason) => {
+            lines.push(Line::from(Span::styled(
+                reason.clone(),
+                Style::new().red().bold(),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(
+                "Refine the description above and press Ctrl+G again.".dim(),
+            ));
+            for entry in app.tool_editor.generation_log.iter().rev().take(10).rev() {
+                lines.push(Line::from(entry.clone().dim()));
+            }
+        }
+        GenerationState::Generated => {
+            if let Some(draft) = &app.tool_editor.last_draft_version_id {
+                lines.push(Line::from(vec!["draft > ".green(), draft.clone().dim()]));
+                lines.push(Line::from(
+                    "Review the script on the left. Ctrl+R re-runs with current ARGS_JSON. Ctrl+P publishes.".dim(),
+                ));
+                lines.push(Line::from(""));
+            }
+            match &app.tool_editor.last_result {
+                Some(result) => push_result_lines(result, &mut lines),
+                None => {
+                    for entry in app.tool_editor.generation_log.iter().rev().take(8).rev() {
+                        lines.push(Line::from(entry.clone().dim()));
+                    }
+                }
+            }
+        }
     }
     if let Some(notice) = &app.tools_notice {
         lines.push(Line::from(""));
@@ -386,7 +582,7 @@ fn render_editor_results(app: &App, area: Rect, buf: &mut Buffer) {
             Block::bordered()
                 .title_top(Line::from(vec![
                     " ".into(),
-                    "Results".bold().cyan(),
+                    title.bold().cyan(),
                     " ".into(),
                 ]))
                 .border_type(BorderType::Rounded)
@@ -434,24 +630,37 @@ fn push_result_lines(result: &ToolEditorResult, lines: &mut Vec<Line>) {
     }
 }
 
-fn render_footer(_app: &App, area: Rect, buf: &mut Buffer, editor: bool) {
+fn render_footer(app: &App, area: Rect, buf: &mut Buffer, editor: bool) {
     let spans = if editor {
-        vec![
-            " EDITOR ".bold().on_dark_gray(),
-            "  ".into(),
-            "Tab ".bold().cyan(),
-            "focus ".dim(),
-            "F2 ".bold().yellow(),
-            "lang ".dim(),
-            "Ctrl+R ".bold().green(),
-            "run ".dim(),
-            "Ctrl+S ".bold().green(),
-            "save ".dim(),
-            "Ctrl+P ".bold().green(),
-            "publish ".dim(),
-            "Esc ".bold().magenta(),
-            "back".dim(),
-        ]
+        if matches!(app.tool_editor.generation, GenerationState::Generated) {
+            vec![
+                " REVIEW ".bold().on_dark_gray(),
+                "  ".into(),
+                "Tab ".bold().cyan(),
+                "focus ".dim(),
+                "F2 ".bold().yellow(),
+                "lang ".dim(),
+                "Ctrl+R ".bold().green(),
+                "run ".dim(),
+                "Ctrl+S ".bold().green(),
+                "save ".dim(),
+                "Ctrl+P ".bold().green(),
+                "publish ".dim(),
+                "Esc ".bold().magenta(),
+                "back".dim(),
+            ]
+        } else {
+            vec![
+                " DESCRIBE ".bold().on_dark_gray(),
+                "  ".into(),
+                "Tab ".bold().cyan(),
+                "focus ".dim(),
+                "Ctrl+G ".bold().green(),
+                "generate ".dim(),
+                "Esc ".bold().magenta(),
+                "back".dim(),
+            ]
+        }
     } else {
         vec![
             " TOOLS ".bold().on_dark_gray(),
@@ -459,8 +668,12 @@ fn render_footer(_app: &App, area: Rect, buf: &mut Buffer, editor: bool) {
             "↑↓ ".bold().cyan(),
             "navigate ".dim(),
             "N ".bold().green(),
-            "new tool ".dim(),
-            "ESC ".bold().magenta(),
+            "new ".dim(),
+            "Enter ".bold().cyan(),
+            "reopen draft ".dim(),
+            "D ".bold().red(),
+            "delete ".dim(),
+            "Esc ".bold().magenta(),
             "back".dim(),
         ]
     };
@@ -498,6 +711,7 @@ fn output_policy_label(policy: ToolOutputPolicy) -> &'static str {
 fn status_label(status: ToolAvailability) -> &'static str {
     match status {
         ToolAvailability::Active => "Active",
+        ToolAvailability::Draft => "Draft",
         ToolAvailability::MissingLocally => "Missing local",
         ToolAvailability::MissingRemotely => "Missing server",
     }
@@ -506,6 +720,7 @@ fn status_label(status: ToolAvailability) -> &'static str {
 fn status_style(status: ToolAvailability) -> Style {
     match status {
         ToolAvailability::Active => Style::new().green(),
+        ToolAvailability::Draft => Style::new().yellow().bold(),
         ToolAvailability::MissingLocally => Style::new().yellow(),
         ToolAvailability::MissingRemotely => Style::new().red(),
     }

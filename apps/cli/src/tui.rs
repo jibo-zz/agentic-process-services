@@ -1,7 +1,7 @@
 use crate::{
     app::{
-        App, PendingToolApproval, ToolEditorAction, ToolEditorResult, ToolEditorResultKind,
-        ToolEditorSnapshot,
+        App, GenerationState, PendingToolApproval, ToolEditorAction, ToolEditorResult,
+        ToolEditorResultKind, ToolEditorSnapshot,
     },
     ui,
 };
@@ -27,8 +27,8 @@ const CURSOR_COLOR_RESET: &str = "\x1b]112\x07";
 
 use crate::app::Route;
 use agentic_protocol::{
-    ChatStreamEvent, LocalToolScript, SaveDraftParams, SessionSummary, ToolResultParams, ToolRisk,
-    ToolVersionRow, ToolsListResponse, UiMessage,
+    AuthorRequest, ChatStreamEvent, LocalToolScript, SaveDraftParams, SessionSummary,
+    ToolResultParams, ToolRisk, ToolVersionRow, ToolsListResponse, UiMessage,
 };
 use agentic_tools::WorkspaceGuard;
 use cli::client::{FetchError, Fetcher};
@@ -48,13 +48,37 @@ enum ChatEvent {
 
 enum EditorEvent {
     RunResult(ToolEditorResult),
-    DraftSaved { row: ToolVersionRow },
-    Registered { row: ToolVersionRow },
+    DraftSaved {
+        row: ToolVersionRow,
+    },
+    Registered {
+        row: ToolVersionRow,
+    },
     Error(String),
+    ToolDeleted {
+        name: String,
+    },
+    ToolDeleteFailed {
+        name: String,
+        error: String,
+    },
+    GenerationStarted,
+    GenerationProgress {
+        line: String,
+    },
+    GenerationDone {
+        version_id: String,
+        name: String,
+        language: agentic_protocol::ToolScriptLanguage,
+        script: String,
+        args_schema: serde_json::Value,
+    },
+    GenerationFailed(String),
 }
 
 type SessionsOpenResult = Result<(String, Vec<UiMessage>), FetchError>;
-type ToolsListResult = Result<ToolsListResponse, FetchError>;
+type ToolsListResult =
+    Result<(ToolsListResponse, agentic_protocol::ToolsManagementResponse), FetchError>;
 
 pub fn run() -> Result<()> {
     let mut terminal = init_terminal()?;
@@ -93,7 +117,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
             tools_rx = Some(rx);
             let f = fetcher.clone();
             runtime.spawn(async move {
-                let _ = tx.send(f.tools_list().await);
+                let _ = tx.send(load_tools(&f).await);
             });
         }
 
@@ -194,7 +218,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
             && let Ok(result) = rx.try_recv()
         {
             match result {
-                Ok(response) => app.set_tools_from_server(response.tools),
+                Ok((list, mgmt)) => app.set_tools_from_server(list.tools, mgmt.tools),
                 Err(error) => {
                     app.set_tools_error(format!("Server tool registry unavailable: {error}"))
                 }
@@ -202,55 +226,107 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
             tools_rx = None;
         }
 
-        // Drain editor task results.
+        // Drain editor task results. When the sender drops (one-shot task done) clear
+        // `editor_rx` so the next editor action can take the slot — otherwise subsequent
+        // dispatches are silently dropped.
+        let mut editor_rx_done = false;
         if let Some(ref rx) = editor_rx {
-            while let Ok(event) = rx.try_recv() {
-                match event {
-                    EditorEvent::RunResult(result) => app.set_editor_result(result),
-                    EditorEvent::DraftSaved { row } => {
-                        app.set_last_draft_version_id(row.id.clone());
-                        app.set_editor_result(ToolEditorResult {
-                            kind: ToolEditorResultKind::Success,
-                            message: format!("Saved draft v{} ({})", row.version, row.id),
-                            stdout: String::new(),
-                            stderr: String::new(),
-                            exit_code: None,
-                            duration_ms: 0,
-                        });
+            loop {
+                match rx.try_recv() {
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        editor_rx_done = true;
+                        break;
                     }
-                    EditorEvent::Registered { row } => {
-                        app.set_editor_result(ToolEditorResult {
-                            kind: ToolEditorResultKind::Success,
-                            message: format!(
-                                "Registered '{}' v{} as active",
-                                short_id(&row.tool_id),
-                                row.version
-                            ),
-                            stdout: String::new(),
-                            stderr: String::new(),
-                            exit_code: None,
-                            duration_ms: 0,
-                        });
-                        // refresh the tools list so the new tool surfaces in the table
-                        let (tx, rx) = mpsc::channel();
-                        tools_rx = Some(rx);
-                        let f = fetcher.clone();
-                        runtime.spawn(async move {
-                            let _ = tx.send(f.tools_list().await);
-                        });
-                    }
-                    EditorEvent::Error(message) => {
-                        app.set_editor_result(ToolEditorResult {
-                            kind: ToolEditorResultKind::Failure,
-                            message,
-                            stdout: String::new(),
-                            stderr: String::new(),
-                            exit_code: None,
-                            duration_ms: 0,
-                        });
-                    }
+                    Ok(event) => match event {
+                        EditorEvent::RunResult(result) => app.set_editor_result(result),
+                        EditorEvent::DraftSaved { row } => {
+                            app.set_last_draft_version_id(row.id.clone());
+                            app.set_editor_result(ToolEditorResult {
+                                kind: ToolEditorResultKind::Success,
+                                message: format!("Saved draft v{} ({})", row.version, row.id),
+                                stdout: String::new(),
+                                stderr: String::new(),
+                                exit_code: None,
+                                duration_ms: 0,
+                            });
+                        }
+                        EditorEvent::Registered { row } => {
+                            app.set_editor_result(ToolEditorResult {
+                                kind: ToolEditorResultKind::Success,
+                                message: format!(
+                                    "Registered '{}' v{} as active",
+                                    short_id(&row.tool_id),
+                                    row.version
+                                ),
+                                stdout: String::new(),
+                                stderr: String::new(),
+                                exit_code: None,
+                                duration_ms: 0,
+                            });
+                            // refresh the tools list so the new tool surfaces in the table
+                            let (tx, rx) = mpsc::channel();
+                            tools_rx = Some(rx);
+                            let f = fetcher.clone();
+                            runtime.spawn(async move {
+                                let _ = tx.send(load_tools(&f).await);
+                            });
+                        }
+                        EditorEvent::ToolDeleted { name } => {
+                            app.tools_notice = Some(format!("Deleted tool '{name}'."));
+                            let (tx, rx) = mpsc::channel();
+                            tools_rx = Some(rx);
+                            app.tools_loaded = false;
+                            let f = fetcher.clone();
+                            runtime.spawn(async move {
+                                let _ = tx.send(load_tools(&f).await);
+                            });
+                        }
+                        EditorEvent::ToolDeleteFailed { name, error } => {
+                            app.tools_notice = Some(format!("Delete '{name}' failed: {error}"));
+                        }
+                        EditorEvent::Error(message) => {
+                            app.set_editor_result(ToolEditorResult {
+                                kind: ToolEditorResultKind::Failure,
+                                message,
+                                stdout: String::new(),
+                                stderr: String::new(),
+                                exit_code: None,
+                                duration_ms: 0,
+                            });
+                        }
+                        EditorEvent::GenerationStarted => {
+                            app.clear_generation_log();
+                            app.set_generation_state(GenerationState::Generating);
+                            app.push_generation_log("Author agent started. Working...");
+                        }
+                        EditorEvent::GenerationProgress { line } => {
+                            app.push_generation_log(line);
+                        }
+                        EditorEvent::GenerationDone {
+                            version_id,
+                            name,
+                            language,
+                            script,
+                            args_schema,
+                        } => {
+                            app.push_generation_log(format!(
+                                "Generated draft v_id={} for tool '{}'. Press Ctrl+P to publish.",
+                                short_id(&version_id),
+                                name
+                            ));
+                            app.apply_author_done(version_id, name, language, script, args_schema);
+                        }
+                        EditorEvent::GenerationFailed(reason) => {
+                            app.push_generation_log(format!("Generation failed: {reason}"));
+                            app.set_generation_state(GenerationState::Failed(reason));
+                        }
+                    },
                 }
             }
+        }
+        if editor_rx_done {
+            editor_rx = None;
         }
 
         // Drain pending chat events before rendering.
@@ -333,6 +409,37 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                                 snapshot,
                             );
                         }
+                    }
+                    if let Some((target, confirmed)) = app.take_tool_delete_decision()
+                        && confirmed
+                    {
+                        let (tx, rx) = mpsc::channel();
+                        editor_rx = Some(rx);
+                        let f = fetcher.clone();
+                        let tool_id = target.tool_id.clone();
+                        let name = target.name.clone();
+                        runtime.spawn(async move {
+                            match f.tools_delete_tool(tool_id).await {
+                                Ok(ack) if ack.deleted => {
+                                    let _ = tx.send(EditorEvent::ToolDeleted { name });
+                                }
+                                Ok(_) => {
+                                    let _ = tx.send(EditorEvent::ToolDeleteFailed {
+                                        name,
+                                        error: "Tool not found on server".to_owned(),
+                                    });
+                                }
+                                Err(error) => {
+                                    let _ = tx.send(EditorEvent::ToolDeleteFailed {
+                                        name,
+                                        error: error.to_string(),
+                                    });
+                                }
+                            }
+                        });
+                    }
+                    if let Some(item) = app.take_pending_reopen_draft() {
+                        app.reopen_draft(item);
                     }
                     if should_quit {
                         break;
@@ -649,6 +756,12 @@ fn stream_auth(app: &App) -> Option<(String, String)> {
     Some((app.stream_id.clone()?, app.stream_secret.clone()?))
 }
 
+async fn load_tools(fetcher: &Fetcher) -> ToolsListResult {
+    let list = fetcher.tools_list().await?;
+    let mgmt = fetcher.tools_management().await?;
+    Ok((list, mgmt))
+}
+
 fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
@@ -662,11 +775,166 @@ fn dispatch_editor_action(
     snapshot: ToolEditorSnapshot,
 ) {
     match action {
+        ToolEditorAction::Generate => spawn_editor_generate(
+            runtime,
+            fetcher.clone(),
+            workspace_guard.clone(),
+            tx,
+            snapshot,
+        ),
         ToolEditorAction::Run => spawn_editor_run(runtime, workspace_guard.clone(), tx, snapshot),
         ToolEditorAction::SaveDraft => {
             spawn_editor_save_draft(runtime, fetcher.clone(), tx, snapshot)
         }
         ToolEditorAction::Register => spawn_editor_register(runtime, fetcher.clone(), tx, snapshot),
+    }
+}
+
+fn spawn_editor_generate(
+    runtime: &tokio::runtime::Runtime,
+    fetcher: Fetcher,
+    guard: WorkspaceGuard,
+    tx: mpsc::Sender<EditorEvent>,
+    snapshot: ToolEditorSnapshot,
+) {
+    runtime.spawn(async move {
+        if snapshot.description.is_empty() {
+            let _ = tx.send(EditorEvent::GenerationFailed(
+                "Describe the tool first.".to_owned(),
+            ));
+            return;
+        }
+        let req = AuthorRequest {
+            description: snapshot.description,
+            input_hint: Some(snapshot.input_hint).filter(|s| !s.is_empty()),
+            output_hint: Some(snapshot.output_hint).filter(|s| !s.is_empty()),
+        };
+        let stream = match fetcher.author_stream(req).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                let _ = tx.send(EditorEvent::GenerationFailed(error.to_string()));
+                return;
+            }
+        };
+        let _ = tx.send(EditorEvent::GenerationStarted);
+        tokio::pin!(stream);
+
+        let mut stream_id = String::new();
+        let mut stream_secret = String::new();
+        let mut finished = false;
+
+        while let Some(item) = stream.next().await {
+            let event = match item {
+                Ok(event) => event,
+                Err(error) => {
+                    let _ = tx.send(EditorEvent::GenerationFailed(error.to_string()));
+                    return;
+                }
+            };
+            match event {
+                ChatStreamEvent::StreamReady {
+                    stream_id: id,
+                    stream_secret: secret,
+                } => {
+                    stream_id = id;
+                    stream_secret = secret;
+                }
+                ChatStreamEvent::ToolUpdate { name, state, .. } => {
+                    let _ = tx.send(EditorEvent::GenerationProgress {
+                        line: format!("tool: {name} -> {state:?}"),
+                    });
+                }
+                ChatStreamEvent::ReasoningDelta { .. } => {}
+                ChatStreamEvent::TextDelta { text } => {
+                    if !text.trim().is_empty() {
+                        let _ = tx.send(EditorEvent::GenerationProgress {
+                            line: format!("agent: {}", text.trim()),
+                        });
+                    }
+                }
+                ChatStreamEvent::LocalToolRequest {
+                    invocation_id,
+                    name,
+                    input,
+                    script: Some(script),
+                    ..
+                } => {
+                    let _ = tx.send(EditorEvent::GenerationProgress {
+                        line: format!("sandbox_run: {}", short_args(&input)),
+                    });
+                    let outcome = local_tools::execute_tier2(&guard, input, script).await;
+                    let (output, error) = match outcome {
+                        Ok(v) => (Some(v), None),
+                        Err(e) => (None, Some(e)),
+                    };
+                    let _ = fetcher
+                        .tools_result(ToolResultParams {
+                            stream_id: stream_id.clone(),
+                            stream_secret: stream_secret.clone(),
+                            invocation_id,
+                            output,
+                            error,
+                        })
+                        .await;
+                    let _ = name;
+                }
+                ChatStreamEvent::LocalToolRequest {
+                    invocation_id,
+                    name,
+                    ..
+                } => {
+                    // Tier-1 request would be unexpected here (the author agent has no Tier-1
+                    // tools), but ack it so the server's bridge doesn't sit blocked for 600s.
+                    let _ = fetcher
+                        .tools_result(ToolResultParams {
+                            stream_id: stream_id.clone(),
+                            stream_secret: stream_secret.clone(),
+                            invocation_id,
+                            output: None,
+                            error: Some(format!(
+                                "Tier-1 tool '{name}' is not available during tool authoring"
+                            )),
+                        })
+                        .await;
+                }
+                ChatStreamEvent::AuthorDone {
+                    version_id,
+                    name,
+                    language,
+                    script,
+                    args_schema,
+                    ..
+                } => {
+                    let _ = tx.send(EditorEvent::GenerationDone {
+                        version_id,
+                        name,
+                        language,
+                        script,
+                        args_schema,
+                    });
+                    finished = true;
+                }
+                ChatStreamEvent::Error { message } => {
+                    let _ = tx.send(EditorEvent::GenerationFailed(message));
+                    finished = true;
+                }
+                ChatStreamEvent::MessageStart { .. } | ChatStreamEvent::MessageDone => {}
+            }
+        }
+        if !finished {
+            let _ = tx.send(EditorEvent::GenerationFailed(
+                "Generation stream ended without a result.".to_owned(),
+            ));
+        }
+    });
+}
+
+fn short_args(value: &serde_json::Value) -> String {
+    let s = value.to_string();
+    if s.len() > 64 {
+        format!("{}…", &s[..63])
+    } else {
+        s
     }
 }
 

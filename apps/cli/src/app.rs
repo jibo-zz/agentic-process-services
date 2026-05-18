@@ -1,7 +1,7 @@
 use crate::sessions::Session;
 use agentic_protocol::{
-    ChatStreamEvent, LocalToolScript, SessionSummary, ToolDescriptor, ToolExecutionKind,
-    ToolScriptLanguage, ToolState, UiMessage, UiPart, UiRole,
+    ChatStreamEvent, LocalToolScript, SessionSummary, ToolDescriptor, ToolExecutionKind, ToolRow,
+    ToolScriptLanguage, ToolState, ToolVersionStatus, UiMessage, UiPart, UiRole,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{BTreeSet, HashMap};
@@ -126,6 +126,7 @@ impl Route {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolAvailability {
     Active,
+    Draft,
     MissingLocally,
     MissingRemotely,
 }
@@ -134,13 +135,39 @@ pub enum ToolAvailability {
 pub struct ToolDashboardItem {
     pub descriptor: ToolDescriptor,
     pub availability: ToolAvailability,
+    /// Set for DB-backed tools (active or draft). `None` for built-in Tier-1.
+    pub tool_id: Option<String>,
+    /// Set only for drafts so `Enter` can reopen exactly that version.
+    pub version_id: Option<String>,
+    /// Set only for drafts; the script body and language used to reopen the editor.
+    pub draft_script: Option<String>,
+    pub draft_language: Option<ToolScriptLanguage>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingToolDelete {
+    pub tool_id: String,
+    pub name: String,
+    pub is_draft: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolEditorField {
+    Description,
+    InputHint,
+    OutputHint,
     Name,
     Script,
     Args,
+}
+
+#[derive(Clone, Debug, Default)]
+pub enum GenerationState {
+    #[default]
+    Idle,
+    Generating,
+    Generated,
+    Failed(String),
 }
 
 #[derive(Clone, Debug)]
@@ -163,12 +190,17 @@ pub enum ToolEditorResultKind {
 pub struct ToolEditor {
     pub open: bool,
     pub field: Option<ToolEditorField>,
+    pub description: TextField,
+    pub input_hint: TextField,
+    pub output_hint: TextField,
     pub name: TextField,
     pub language: ToolEditorLanguage,
     pub script: TextField,
     pub args: TextField,
     pub last_draft_version_id: Option<String>,
     pub last_result: Option<ToolEditorResult>,
+    pub generation: GenerationState,
+    pub generation_log: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -203,6 +235,7 @@ impl ToolEditorLanguage {
 
 #[derive(Clone, Debug)]
 pub enum ToolEditorAction {
+    Generate,
     Run,
     SaveDraft,
     Register,
@@ -215,6 +248,9 @@ pub struct ToolEditorSnapshot {
     pub script: String,
     pub args: String,
     pub last_draft_version_id: Option<String>,
+    pub description: String,
+    pub input_hint: String,
+    pub output_hint: String,
 }
 
 #[derive(Default)]
@@ -323,6 +359,9 @@ pub struct App {
     pub tools_notice: Option<String>,
     pub tool_editor: ToolEditor,
     pending_editor_action: Option<ToolEditorAction>,
+    pub pending_tool_delete: Option<PendingToolDelete>,
+    tool_delete_decision: Option<(PendingToolDelete, bool)>,
+    pending_reopen_draft: Option<ToolDashboardItem>,
 }
 
 impl App {
@@ -425,7 +464,7 @@ impl App {
                 );
             }
             ChatStreamEvent::Error { message } => assistant.parts.push(UiPart::Error { message }),
-            ChatStreamEvent::MessageDone => {}
+            ChatStreamEvent::AuthorDone { .. } | ChatStreamEvent::MessageDone => {}
         }
     }
 
@@ -524,6 +563,10 @@ impl App {
                 self.route = Route::Home;
                 false
             }
+            KeyCode::Esc if self.pending_tool_delete.is_some() => {
+                self.pending_tool_delete = None;
+                false
+            }
             KeyCode::Esc if matches!(self.route, Route::Tools) && self.tool_editor.open => {
                 self.close_tool_editor();
                 false
@@ -534,6 +577,19 @@ impl App {
             }
             KeyCode::Esc => true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
+
+            KeyCode::Char('y') | KeyCode::Char('Y') if self.pending_tool_delete.is_some() => {
+                if let Some(target) = self.pending_tool_delete.take() {
+                    self.tool_delete_decision = Some((target, true));
+                }
+                false
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') if self.pending_tool_delete.is_some() => {
+                if let Some(target) = self.pending_tool_delete.take() {
+                    self.tool_delete_decision = Some((target, false));
+                }
+                false
+            }
 
             KeyCode::Char('y') | KeyCode::Char('Y') if self.has_pending_tool_approval() => {
                 if let Some(approval) = self.pending_tool_approval.take() {
@@ -590,6 +646,16 @@ impl App {
             }
             KeyCode::Char('n') | KeyCode::Char('N') if matches!(self.route, Route::Tools) => {
                 self.open_tool_editor();
+                false
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete
+                if matches!(self.route, Route::Tools) =>
+            {
+                self.request_tool_delete();
+                false
+            }
+            KeyCode::Enter if matches!(self.route, Route::Tools) => {
+                self.request_reopen_draft();
                 false
             }
 
@@ -709,7 +775,11 @@ impl App {
         true
     }
 
-    pub fn set_tools_from_server(&mut self, server_tools: Vec<ToolDescriptor>) {
+    pub fn set_tools_from_server(
+        &mut self,
+        server_tools: Vec<ToolDescriptor>,
+        management: Vec<ToolRow>,
+    ) {
         let local_tools = agentic_tools::descriptors();
         let server_by_name = server_tools
             .into_iter()
@@ -719,17 +789,22 @@ impl App {
             .into_iter()
             .map(|tool| (tool.name.clone(), tool))
             .collect::<HashMap<_, _>>();
+        let management_by_name: HashMap<String, ToolRow> = management
+            .into_iter()
+            .map(|t| (t.name.clone(), t))
+            .collect();
         let names = server_by_name
             .keys()
             .chain(local_by_name.keys())
             .cloned()
             .collect::<BTreeSet<_>>();
 
-        self.tools = names
+        let mut items: Vec<ToolDashboardItem> = names
             .into_iter()
             .filter_map(|name| {
                 let server = server_by_name.get(&name);
                 let local = local_by_name.get(&name);
+                let tool_id = management_by_name.get(&name).map(|t| t.id.clone());
                 match (server, local) {
                     (Some(server), Some(local)) => Some(ToolDashboardItem {
                         descriptor: server.clone(),
@@ -738,6 +813,10 @@ impl App {
                         } else {
                             ToolAvailability::MissingLocally
                         },
+                        tool_id,
+                        version_id: None,
+                        draft_script: None,
+                        draft_language: None,
                     }),
                     (Some(server), None) => Some(ToolDashboardItem {
                         descriptor: server.clone(),
@@ -746,15 +825,53 @@ impl App {
                         } else {
                             ToolAvailability::MissingLocally
                         },
+                        tool_id,
+                        version_id: None,
+                        draft_script: None,
+                        draft_language: None,
                     }),
                     (None, Some(local)) => Some(ToolDashboardItem {
                         descriptor: local.clone(),
                         availability: ToolAvailability::MissingRemotely,
+                        tool_id: None,
+                        version_id: None,
+                        draft_script: None,
+                        draft_language: None,
                     }),
                     (None, None) => None,
                 }
             })
             .collect();
+
+        // Append draft rows (newest first by tool, latest version first within tool).
+        for (_, tool) in management_by_name.iter() {
+            for version in &tool.versions {
+                if !matches!(version.status, ToolVersionStatus::Draft) {
+                    continue;
+                }
+                items.push(ToolDashboardItem {
+                    descriptor: ToolDescriptor {
+                        name: tool.name.clone(),
+                        description: version.description.clone(),
+                        execution: ToolExecutionKind::LocalProxy,
+                        approval_required: !matches!(
+                            version.risk,
+                            agentic_protocol::ToolRisk::ReadOnly
+                        ),
+                        risk: version.risk,
+                        output_policy: agentic_protocol::ToolOutputPolicy::SummaryOnly,
+                        parameters: version.args_schema.clone(),
+                    },
+                    availability: ToolAvailability::Draft,
+                    tool_id: Some(tool.id.clone()),
+                    version_id: Some(version.id.clone()),
+                    draft_script: Some(version.script.clone()),
+                    draft_language: Some(version.language),
+                });
+            }
+        }
+
+        self.tools = items;
         self.tools_cursor = self.tools_cursor.min(self.tools.len().saturating_sub(1));
         self.tools_loaded = true;
     }
@@ -765,16 +882,81 @@ impl App {
             .map(|descriptor| ToolDashboardItem {
                 descriptor,
                 availability: ToolAvailability::MissingRemotely,
+                tool_id: None,
+                version_id: None,
+                draft_script: None,
+                draft_language: None,
             })
             .collect();
         self.tools_loaded = true;
         self.tools_notice = Some(message.into());
     }
 
+    fn request_tool_delete(&mut self) {
+        let Some(item) = self.tools.get(self.tools_cursor) else {
+            return;
+        };
+        let Some(tool_id) = item.tool_id.clone() else {
+            self.tools_notice =
+                Some("Built-in tools can't be deleted (compile-time only).".to_owned());
+            return;
+        };
+        let is_draft = matches!(item.availability, ToolAvailability::Draft);
+        self.pending_tool_delete = Some(PendingToolDelete {
+            tool_id,
+            name: item.descriptor.name.clone(),
+            is_draft,
+        });
+    }
+
+    pub fn take_tool_delete_decision(&mut self) -> Option<(PendingToolDelete, bool)> {
+        self.tool_delete_decision.take()
+    }
+
+    fn request_reopen_draft(&mut self) {
+        let Some(item) = self.tools.get(self.tools_cursor) else {
+            return;
+        };
+        if !matches!(item.availability, ToolAvailability::Draft) {
+            return;
+        }
+        self.pending_reopen_draft = Some(item.clone());
+    }
+
+    pub fn take_pending_reopen_draft(&mut self) -> Option<ToolDashboardItem> {
+        self.pending_reopen_draft.take()
+    }
+
+    /// Re-opens an existing draft in the editor, pre-populated for review/publish.
+    pub fn reopen_draft(&mut self, item: ToolDashboardItem) {
+        let (Some(version_id), Some(script), Some(language)) =
+            (item.version_id, item.draft_script, item.draft_language)
+        else {
+            return;
+        };
+        self.tools_notice = None;
+        self.tool_editor.open = true;
+        self.tool_editor.description = TextField::default();
+        self.tool_editor.input_hint = TextField::default();
+        self.tool_editor.output_hint = TextField::default();
+        self.tool_editor.name = TextField::from_initial(item.descriptor.name.clone());
+        self.tool_editor.script = TextField::from_initial(script);
+        self.tool_editor.args = TextField::from_initial("{}");
+        self.tool_editor.language = match language {
+            ToolScriptLanguage::Python => ToolEditorLanguage::Python,
+            ToolScriptLanguage::Shell => ToolEditorLanguage::Shell,
+        };
+        self.tool_editor.last_draft_version_id = Some(version_id);
+        self.tool_editor.last_result = None;
+        self.tool_editor.generation = GenerationState::Generated;
+        self.tool_editor.generation_log.clear();
+        self.tool_editor.field = Some(ToolEditorField::Script);
+    }
+
     fn open_tool_editor(&mut self) {
         self.tools_notice = None;
         self.tool_editor.open = true;
-        self.tool_editor.field = Some(ToolEditorField::Name);
+        self.tool_editor.field = Some(ToolEditorField::Description);
         if self.tool_editor.args.is_empty() {
             // sensible default so the user sees the shape of ARGS_JSON.
             self.tool_editor.args = TextField::from_initial("{}");
@@ -798,6 +980,52 @@ impl App {
         self.tool_editor.last_draft_version_id = Some(version_id);
     }
 
+    pub fn set_generation_state(&mut self, state: GenerationState) {
+        self.tool_editor.generation = state;
+    }
+
+    pub fn push_generation_log(&mut self, line: impl Into<String>) {
+        let line = line.into();
+        if !line.is_empty() {
+            self.tool_editor.generation_log.push(line);
+            // keep the log bounded for the results pane
+            if self.tool_editor.generation_log.len() > 80 {
+                let overflow = self.tool_editor.generation_log.len() - 80;
+                self.tool_editor.generation_log.drain(..overflow);
+            }
+        }
+    }
+
+    pub fn clear_generation_log(&mut self) {
+        self.tool_editor.generation_log.clear();
+    }
+
+    pub fn apply_author_done(
+        &mut self,
+        version_id: String,
+        name: String,
+        language: ToolScriptLanguage,
+        script: String,
+        args_schema: serde_json::Value,
+    ) {
+        self.tool_editor.name = TextField::from_initial(name);
+        self.tool_editor.script = TextField::from_initial(script);
+        self.tool_editor.language = match language {
+            ToolScriptLanguage::Python => ToolEditorLanguage::Python,
+            ToolScriptLanguage::Shell => ToolEditorLanguage::Shell,
+        };
+        let args_default = args_schema
+            .get("example")
+            .cloned()
+            .or_else(|| Some(serde_json::json!({})))
+            .map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_owned()))
+            .unwrap_or_else(|| "{}".to_owned());
+        self.tool_editor.args = TextField::from_initial(args_default);
+        self.tool_editor.last_draft_version_id = Some(version_id);
+        self.tool_editor.generation = GenerationState::Generated;
+        self.tool_editor.field = Some(ToolEditorField::Script);
+    }
+
     pub fn editor_snapshot(&self) -> ToolEditorSnapshot {
         ToolEditorSnapshot {
             name: self.tool_editor.name.as_str().trim().to_owned(),
@@ -805,6 +1033,9 @@ impl App {
             script: self.tool_editor.script.as_str().to_owned(),
             args: self.tool_editor.args.as_str().to_owned(),
             last_draft_version_id: self.tool_editor.last_draft_version_id.clone(),
+            description: self.tool_editor.description.as_str().trim().to_owned(),
+            input_hint: self.tool_editor.input_hint.as_str().trim().to_owned(),
+            output_hint: self.tool_editor.output_hint.as_str().trim().to_owned(),
         }
     }
 
@@ -812,6 +1043,10 @@ impl App {
         // Action shortcuts (Ctrl-keyed) work regardless of focused field.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
+                KeyCode::Char('g') | KeyCode::Char('G') => {
+                    self.pending_editor_action = Some(ToolEditorAction::Generate);
+                    return;
+                }
                 KeyCode::Char('r') | KeyCode::Char('R') => {
                     self.pending_editor_action = Some(ToolEditorAction::Run);
                     return;
@@ -831,29 +1066,60 @@ impl App {
             KeyCode::Tab => self.editor_focus_next(),
             KeyCode::BackTab => self.editor_focus_prev(),
             KeyCode::F(2) => self.tool_editor.language = self.tool_editor.language.toggle(),
-            KeyCode::Enter if matches!(self.tool_editor.field, Some(ToolEditorField::Script)) => {
-                self.tool_editor.script.insert_char('\n');
+            KeyCode::Enter
+                if matches!(
+                    self.tool_editor.field,
+                    Some(ToolEditorField::Script) | Some(ToolEditorField::Description)
+                ) =>
+            {
+                self.editor_insert_newline();
             }
             _ => self.editor_field_key(key),
         }
     }
 
     fn editor_focus_next(&mut self) {
-        self.tool_editor.field = Some(match self.tool_editor.field {
-            None => ToolEditorField::Name,
-            Some(ToolEditorField::Name) => ToolEditorField::Script,
-            Some(ToolEditorField::Script) => ToolEditorField::Args,
-            Some(ToolEditorField::Args) => ToolEditorField::Name,
-        });
+        let cycle = self.editor_field_cycle();
+        let current = self.tool_editor.field;
+        let next = current
+            .and_then(|f| {
+                cycle
+                    .iter()
+                    .position(|&c| c == f)
+                    .map(|i| cycle[(i + 1) % cycle.len()])
+            })
+            .unwrap_or(cycle[0]);
+        self.tool_editor.field = Some(next);
     }
 
     fn editor_focus_prev(&mut self) {
-        self.tool_editor.field = Some(match self.tool_editor.field {
-            None => ToolEditorField::Args,
-            Some(ToolEditorField::Name) => ToolEditorField::Args,
-            Some(ToolEditorField::Script) => ToolEditorField::Name,
-            Some(ToolEditorField::Args) => ToolEditorField::Script,
-        });
+        let cycle = self.editor_field_cycle();
+        let current = self.tool_editor.field;
+        let prev = current
+            .and_then(|f| {
+                cycle.iter().position(|&c| c == f).map(|i| {
+                    let len = cycle.len();
+                    cycle[(i + len - 1) % len]
+                })
+            })
+            .unwrap_or(cycle[cycle.len() - 1]);
+        self.tool_editor.field = Some(prev);
+    }
+
+    fn editor_field_cycle(&self) -> &'static [ToolEditorField] {
+        match self.tool_editor.generation {
+            GenerationState::Idle | GenerationState::Failed(_) => &[
+                ToolEditorField::Description,
+                ToolEditorField::InputHint,
+                ToolEditorField::OutputHint,
+            ],
+            GenerationState::Generating => &[ToolEditorField::Description],
+            GenerationState::Generated => &[
+                ToolEditorField::Name,
+                ToolEditorField::Script,
+                ToolEditorField::Args,
+            ],
+        }
     }
 
     fn editor_field_key(&mut self, key: KeyEvent) {
@@ -861,6 +1127,9 @@ impl App {
             return;
         };
         let target: &mut TextField = match field {
+            ToolEditorField::Description => &mut self.tool_editor.description,
+            ToolEditorField::InputHint => &mut self.tool_editor.input_hint,
+            ToolEditorField::OutputHint => &mut self.tool_editor.output_hint,
             ToolEditorField::Name => &mut self.tool_editor.name,
             ToolEditorField::Script => &mut self.tool_editor.script,
             ToolEditorField::Args => &mut self.tool_editor.args,
@@ -875,6 +1144,18 @@ impl App {
             KeyCode::Char(c) => target.insert_char(c),
             _ => {}
         }
+    }
+
+    fn editor_insert_newline(&mut self) {
+        let Some(field) = self.tool_editor.field else {
+            return;
+        };
+        let target: &mut TextField = match field {
+            ToolEditorField::Description => &mut self.tool_editor.description,
+            ToolEditorField::Script => &mut self.tool_editor.script,
+            _ => return,
+        };
+        target.insert_char('\n');
     }
 
     fn open_selected_session(&mut self) {
