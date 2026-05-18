@@ -130,18 +130,62 @@ async fn chat_stream(
     let client = deepseek::Client::from_env().map_err(internal_error)?;
     let stream_auth = state.bridge.new_stream();
     let (event_tx, event_rx) = mpsc::unbounded_channel::<ChatStreamEvent>();
-    let local_tool_context =
-        tools::LocalToolContext::new(state.bridge.clone(), stream_auth.clone(), event_tx.clone());
-    let preamble = agentic_tools::instructions::coding_agent_preamble();
+    let mode = req.mode;
+    let local_tool_context = tools::LocalToolContext::new(
+        state.bridge.clone(),
+        stream_auth.clone(),
+        event_tx.clone(),
+        mode,
+    );
+    let preamble = agentic_tools::instructions::coding_agent_preamble(mode);
 
-    // Build dynamic proxies for every active DB-authored (Tier-2) tool so the agent sees them
-    // alongside the static registry without any rebuild/restart.
-    let db_tools = tool_repo::list_active(&state.db)
-        .await
-        .map_err(internal_error)?;
-    let dynamic_proxies: Vec<Box<dyn rig::tool::ToolDyn>> = db_tools
-        .into_iter()
-        .map(|(tool, version)| {
+    let mut agent_tools: Vec<Box<dyn rig::tool::ToolDyn>> = Vec::new();
+    if agentic_tools::mode_allows_tier1_tool(mode, agentic_tools::GET_CURRENT_WEATHER) {
+        agent_tools.push(Box::new(tools::CurrentWeatherTool));
+    }
+    if agentic_tools::mode_allows_tier1_tool(mode, agentic_tools::LIST_FILES) {
+        agent_tools.push(Box::new(tools::ListFilesProxyTool::new(
+            local_tool_context.clone(),
+        )));
+    }
+    if agentic_tools::mode_allows_tier1_tool(mode, agentic_tools::READ_FILE) {
+        agent_tools.push(Box::new(tools::ReadFileProxyTool::new(
+            local_tool_context.clone(),
+        )));
+    }
+    if agentic_tools::mode_allows_tier1_tool(mode, agentic_tools::SEARCH_FILES) {
+        agent_tools.push(Box::new(tools::SearchFilesProxyTool::new(
+            local_tool_context.clone(),
+        )));
+    }
+    if agentic_tools::mode_allows_tier1_tool(mode, agentic_tools::WRITE_FILE) {
+        agent_tools.push(Box::new(tools::WriteFileProxyTool::new(
+            local_tool_context.clone(),
+        )));
+    }
+    if agentic_tools::mode_allows_tier1_tool(mode, agentic_tools::EDIT_FILE) {
+        agent_tools.push(Box::new(tools::EditFileProxyTool::new(
+            local_tool_context.clone(),
+        )));
+    }
+    if agentic_tools::mode_allows_tier1_tool(mode, agentic_tools::DELETE_FILE) {
+        agent_tools.push(Box::new(tools::DeleteFileProxyTool::new(
+            local_tool_context.clone(),
+        )));
+    }
+    if agentic_tools::mode_allows_tier1_tool(mode, agentic_tools::DELETE_DIRECTORY) {
+        agent_tools.push(Box::new(tools::DeleteDirectoryProxyTool::new(
+            local_tool_context.clone(),
+        )));
+    }
+
+    // Build dynamic proxies for active DB-authored (Tier-2) tools only in modes that allow
+    // subprocess-backed tools. PLAN mode intentionally excludes all Tier-2 tools.
+    if agentic_tools::mode_allows_tier2_tools(mode) {
+        let db_tools = tool_repo::list_active(&state.db)
+            .await
+            .map_err(internal_error)?;
+        agent_tools.extend(db_tools.into_iter().map(|(tool, version)| {
             let approval_required = !matches!(
                 tool_repo::risk_from_str(&version.risk),
                 agentic_protocol::ToolRisk::ReadOnly
@@ -157,22 +201,14 @@ async fn chat_stream(
                 approval_required,
                 local_tool_context.clone(),
             )) as Box<dyn rig::tool::ToolDyn>
-        })
-        .collect();
+        }));
+    }
 
     let agent = client
         .agent(deepseek::DEEPSEEK_V4_FLASH)
         .preamble(&preamble)
         .default_max_turns(AGENT_MAX_TOOL_TURNS)
-        .tool(tools::CurrentWeatherTool)
-        .tool(tools::ListFilesProxyTool::new(local_tool_context.clone()))
-        .tool(tools::ReadFileProxyTool::new(local_tool_context.clone()))
-        .tool(tools::SearchFilesProxyTool::new(local_tool_context.clone()))
-        .tool(tools::WriteFileProxyTool::new(local_tool_context.clone()))
-        .tool(tools::EditFileProxyTool::new(local_tool_context.clone()))
-        .tool(tools::DeleteFileProxyTool::new(local_tool_context.clone()))
-        .tool(tools::DeleteDirectoryProxyTool::new(local_tool_context))
-        .tools(dynamic_proxies)
+        .tools(agent_tools)
         .build();
 
     let agent_stream = agent

@@ -28,6 +28,37 @@ pub struct ChatMessage {
 pub struct ChatRequest {
     pub session_id: String,
     pub message: String,
+    #[serde(default)]
+    pub mode: AgentMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMode {
+    #[default]
+    Build,
+    Plan,
+}
+
+impl AgentMode {
+    pub const ALL: &'static [Self] = &[Self::Build, Self::Plan];
+
+    pub fn all() -> &'static [Self] {
+        Self::ALL
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Build => "BUILD",
+            Self::Plan => "PLAN",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let all = Self::all();
+        let index = all.iter().position(|mode| *mode == self).unwrap_or(0);
+        all[(index + 1) % all.len()]
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -356,6 +387,28 @@ pub struct ToolVersionRow {
     pub timeout_ms: i32,
     pub description: String,
     pub created_at_secs: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_request_defaults_to_build_mode() {
+        let request: ChatRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "s1",
+            "message": "hello"
+        }))
+        .expect("request decodes");
+
+        assert_eq!(request.mode, AgentMode::Build);
+    }
+
+    #[test]
+    fn agent_mode_cycles_through_declared_modes() {
+        assert_eq!(AgentMode::Build.next(), AgentMode::Plan);
+        assert_eq!(AgentMode::Plan.next(), AgentMode::Build);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

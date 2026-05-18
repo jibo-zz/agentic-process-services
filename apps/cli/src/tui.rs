@@ -27,7 +27,7 @@ const CURSOR_COLOR_RESET: &str = "\x1b]112\x07";
 
 use crate::app::Route;
 use agentic_protocol::{
-    AuthorRequest, ChatStreamEvent, LocalToolScript, SaveDraftParams, SessionSummary,
+    AgentMode, AuthorRequest, ChatStreamEvent, LocalToolScript, SaveDraftParams, SessionSummary,
     ToolResultParams, ToolRisk, ToolVersionRow, ToolsListResponse, UiMessage,
 };
 use agentic_tools::WorkspaceGuard;
@@ -147,6 +147,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                 .pending_prompt()
                 .unwrap_or_default()
                 .to_owned();
+            let mode = app.active_mode();
 
             let (tx, rx) = mpsc::channel();
             chat_rx = Some(rx);
@@ -155,7 +156,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
 
             let f = fetcher.clone();
             runtime.spawn(async move {
-                match f.chat_stream(&session_id, &message).await {
+                match f.chat_stream(&session_id, &message, mode).await {
                     Err(e) => {
                         let _ = tx.send(ChatEvent::Err(e.to_string()));
                     }
@@ -480,6 +481,38 @@ fn handle_chat_stream_event(
             summary: _,
             script,
         } => {
+            let mode = active_stream_mode(app);
+            if !mode_allows_local_request(mode, &name, script.as_ref()) {
+                let error = agentic_tools::mode_tool_rejection(mode, &name);
+                app.apply_chat_stream_event(ChatStreamEvent::LocalToolRequest {
+                    invocation_id: invocation_id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                    approval_required: false,
+                    summary: error.clone(),
+                    script: None,
+                });
+                let Some((stream_id, stream_secret)) = stream_auth(app) else {
+                    app.local_tool_finished(invocation_id, name, None, Some(error));
+                    return;
+                };
+                if let Some(tx) = chat_tx.cloned() {
+                    spawn_tool_result_callback(
+                        runtime,
+                        fetcher.clone(),
+                        tx,
+                        stream_id,
+                        stream_secret,
+                        invocation_id,
+                        name,
+                        None,
+                        Some(error),
+                        true,
+                    );
+                }
+                return;
+            }
+
             if approval_required {
                 let summary = match &script {
                     Some(_) => format!("Run {name}?"),
@@ -567,6 +600,22 @@ fn handle_tool_approval_decision(
     let Some(tx) = chat_tx.cloned() else {
         return;
     };
+    let mode = active_stream_mode(app);
+    if !mode_allows_local_request(mode, &approval.name, approval.script.as_ref()) {
+        spawn_tool_result_callback(
+            runtime,
+            fetcher.clone(),
+            tx,
+            stream_id,
+            stream_secret,
+            approval.invocation_id,
+            approval.name.clone(),
+            None,
+            Some(agentic_tools::mode_tool_rejection(mode, &approval.name)),
+            true,
+        );
+        return;
+    }
     if approved {
         if let Some(script) = approval.script {
             spawn_tier2_tool(
@@ -754,6 +803,22 @@ async fn send_tool_result(
 
 fn stream_auth(app: &App) -> Option<(String, String)> {
     Some((app.stream_id.clone()?, app.stream_secret.clone()?))
+}
+
+fn active_stream_mode(app: &App) -> AgentMode {
+    app.stream_mode().unwrap_or_else(|| app.active_mode())
+}
+
+fn mode_allows_local_request(
+    mode: AgentMode,
+    name: &str,
+    script: Option<&LocalToolScript>,
+) -> bool {
+    if script.is_some() {
+        agentic_tools::mode_allows_tier2_tools(mode)
+    } else {
+        agentic_tools::mode_allows_tier1_tool(mode, name)
+    }
 }
 
 async fn load_tools(fetcher: &Fetcher) -> ToolsListResult {

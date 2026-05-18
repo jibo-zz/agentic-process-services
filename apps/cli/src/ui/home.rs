@@ -1,4 +1,5 @@
 use crate::app::App;
+use agentic_protocol::AgentMode;
 use ratatui::{
     Frame,
     buffer::Buffer,
@@ -40,7 +41,10 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     frame.render_widget(LandingHeader, brand);
     let input_inner = render_text_area(frame, app, prompt);
-    frame.render_widget(StatusFooter::new(app.input_len()), footer);
+    frame.render_widget(
+        StatusFooter::new(app.input_len(), app.active_mode()),
+        footer,
+    );
 
     let head = &app.input()[..app.input_caret()];
     let (cx, cy) = super::caret_xy(head, input_inner.width);
@@ -81,7 +85,13 @@ fn render_text_area(frame: &mut Frame, app: &App, area: Rect) -> Rect {
     };
 
     let block = Block::bordered()
-        .title_top(Line::from(vec!["  > ".green(), "Ask Faaido ".bold()]))
+        .title_top(Line::from(vec![
+            "  > ".green(),
+            "Ask Faaido ".bold(),
+            "[ MODE: ".dim(),
+            app.active_mode().label().bold().cyan(),
+            " ] ".dim(),
+        ]))
         .title_bottom(
             Line::from(format!(" {} ", app.text_area_key_bindings_hint()))
                 .right_aligned()
@@ -101,11 +111,12 @@ fn render_text_area(frame: &mut Frame, app: &App, area: Rect) -> Rect {
 
 struct StatusFooter {
     input_len: usize,
+    mode: AgentMode,
 }
 
 impl StatusFooter {
-    fn new(input_len: usize) -> Self {
-        Self { input_len }
+    fn new(input_len: usize, mode: AgentMode) -> Self {
+        Self { input_len, mode }
     }
 }
 
@@ -121,6 +132,12 @@ impl Widget for StatusFooter {
             "send ".dim(),
             "CTRL+ENTER ".bold().green(),
             "newline ".dim(),
+            "  ".into(),
+            "SHIFT+TAB ".bold().cyan(),
+            "mode ".dim(),
+            "  ".into(),
+            "MODE ".bold().green(),
+            self.mode.label().dim(),
             "  ".into(),
             "ESC ".bold().magenta(),
             "quit".dim(),

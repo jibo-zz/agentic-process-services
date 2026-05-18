@@ -1,7 +1,7 @@
 use crate::sessions::Session;
 use agentic_protocol::{
-    ChatStreamEvent, LocalToolScript, SessionSummary, ToolDescriptor, ToolExecutionKind, ToolRow,
-    ToolScriptLanguage, ToolState, ToolVersionStatus, UiMessage, UiPart, UiRole,
+    AgentMode, ChatStreamEvent, LocalToolScript, SessionSummary, ToolDescriptor, ToolExecutionKind,
+    ToolRow, ToolScriptLanguage, ToolState, ToolVersionStatus, UiMessage, UiPart, UiRole,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{BTreeSet, HashMap};
@@ -338,9 +338,11 @@ const TEXTAREA_KEY_BINDINGS: &[TextAreaKeyBinding] = &[
 pub struct App {
     pub route: Route,
     input: TextField,
+    pub active_mode: AgentMode,
     // chat
     pub active_session: Option<Session>,
     pub chat_stream: ChatStream,
+    pub stream_mode: Option<AgentMode>,
     pub chat_scroll: u16,
     pub stream_id: Option<String>,
     pub stream_secret: Option<String>,
@@ -377,8 +379,23 @@ impl App {
     pub fn input_caret(&self) -> usize {
         self.input.caret_byte()
     }
+    pub fn active_mode(&self) -> AgentMode {
+        self.active_mode
+    }
+    pub fn stream_mode(&self) -> Option<AgentMode> {
+        self.stream_mode
+    }
+    pub fn toggle_mode(&mut self) {
+        self.active_mode = self.active_mode.next();
+    }
     pub fn chat_stream(&self) -> &ChatStream {
         &self.chat_stream
+    }
+    fn chat_is_busy(&self) -> bool {
+        matches!(
+            self.chat_stream,
+            ChatStream::Streaming { .. } | ChatStream::Pending(_)
+        )
     }
     pub fn chat_scroll(&self) -> u16 {
         self.chat_scroll
@@ -401,6 +418,7 @@ impl App {
         if let ChatStream::Pending(user_msg) = std::mem::take(&mut self.chat_stream) {
             self.stream_id = None;
             self.stream_secret = None;
+            self.stream_mode = Some(self.active_mode);
             self.pending_tool_approval = None;
             self.approval_decision = None;
             self.chat_stream = ChatStream::Streaming {
@@ -481,6 +499,7 @@ impl App {
         }
         self.stream_id = None;
         self.stream_secret = None;
+        self.stream_mode = None;
         self.pending_tool_approval = None;
         self.approval_decision = None;
     }
@@ -503,6 +522,7 @@ impl App {
             session.messages.push(assistant);
         }
         self.chat_stream = ChatStream::Idle;
+        self.stream_mode = None;
     }
 
     pub fn set_pending_tool_approval(&mut self, approval: PendingToolApproval) {
@@ -627,6 +647,13 @@ impl App {
             }
             KeyCode::Enter if matches!(self.route, Route::Sessions) => {
                 self.open_selected_session();
+                false
+            }
+
+            KeyCode::BackTab
+                if matches!(self.route, Route::Home | Route::Chat) && !self.chat_is_busy() =>
+            {
+                self.toggle_mode();
                 false
             }
 
@@ -1182,6 +1209,7 @@ impl App {
         self.chat_stream = ChatStream::Idle;
         self.stream_id = None;
         self.stream_secret = None;
+        self.stream_mode = None;
         self.pending_tool_approval = None;
         self.approval_decision = None;
         self.chat_scroll = u16::MAX;

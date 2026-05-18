@@ -1,8 +1,8 @@
 use crate::tool_bridge::{StreamAuth, ToolBridge};
 use agentic_db::{DatabaseConnection, repo::tools as tool_repo};
 use agentic_protocol::{
-    ChatStreamEvent, LocalToolScript, SaveDraftParams, ToolRisk, ToolScriptLanguage, ToolTestCase,
-    ToolVersionRow,
+    AgentMode, ChatStreamEvent, LocalToolScript, SaveDraftParams, ToolRisk, ToolScriptLanguage,
+    ToolTestCase, ToolVersionRow,
 };
 use agentic_tools::{
     DELETE_DIRECTORY, DELETE_FILE, EDIT_FILE, LIST_FILES, READ_FILE, SEARCH_FILES, ToolExecution,
@@ -96,6 +96,7 @@ pub struct LocalToolContext {
     bridge: ToolBridge,
     auth: StreamAuth,
     events: mpsc::UnboundedSender<ChatStreamEvent>,
+    mode: AgentMode,
 }
 
 impl LocalToolContext {
@@ -103,11 +104,13 @@ impl LocalToolContext {
         bridge: ToolBridge,
         auth: StreamAuth,
         events: mpsc::UnboundedSender<ChatStreamEvent>,
+        mode: AgentMode,
     ) -> Self {
         Self {
             bridge,
             auth,
             events,
+            mode,
         }
     }
 
@@ -124,6 +127,11 @@ impl LocalToolContext {
                 message: format!("'{name}' is not a local proxy tool"),
             });
         };
+        if !agentic_tools::mode_allows_tier1_tool(self.mode, name) {
+            return Err(ProxyToolError {
+                message: agentic_tools::mode_tool_rejection(self.mode, name),
+            });
+        }
         let summary = agentic_tools::stream_summary(name, &input);
         self.bridge
             .request_local_tool(
@@ -150,6 +158,11 @@ impl LocalToolContext {
         approval_required: bool,
         script: LocalToolScript,
     ) -> Result<serde_json::Value, ProxyToolError> {
+        if !agentic_tools::mode_allows_tier2_tools(self.mode) {
+            return Err(ProxyToolError {
+                message: agentic_tools::mode_tool_rejection(self.mode, &name),
+            });
+        }
         let summary = format!("Run {name}");
         self.bridge
             .request_local_tool(

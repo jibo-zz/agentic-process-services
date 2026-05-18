@@ -1,7 +1,7 @@
 pub mod instructions;
 pub mod runner;
 
-use agentic_protocol::{ToolDescriptor, ToolExecutionKind, ToolOutputPolicy, ToolRisk};
+use agentic_protocol::{AgentMode, ToolDescriptor, ToolExecutionKind, ToolOutputPolicy, ToolRisk};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -155,6 +155,24 @@ pub fn local_tool_names() -> impl Iterator<Item = &'static str> {
         ToolExecution::LocalProxy { .. } => Some(tool.name),
         ToolExecution::ServerNative => None,
     })
+}
+
+pub fn mode_allows_tier1_tool(mode: AgentMode, name: &str) -> bool {
+    match mode {
+        AgentMode::Build => true,
+        AgentMode::Plan => matches!(name, LIST_FILES | READ_FILE | SEARCH_FILES),
+    }
+}
+
+pub fn mode_allows_tier2_tools(mode: AgentMode) -> bool {
+    matches!(mode, AgentMode::Build)
+}
+
+pub fn mode_tool_rejection(mode: AgentMode, name: &str) -> String {
+    format!(
+        "Tool '{name}' is blocked in {} mode. Switch to BUILD mode to run tools outside the safe read-only inspection set.",
+        mode.label()
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -1050,6 +1068,30 @@ mod tests {
         ] {
             assert!(local_tool_names().any(|tool_name| tool_name == name));
         }
+    }
+
+    #[test]
+    fn plan_mode_allows_only_tier1_inspection_tools() {
+        assert!(mode_allows_tier1_tool(AgentMode::Plan, LIST_FILES));
+        assert!(mode_allows_tier1_tool(AgentMode::Plan, READ_FILE));
+        assert!(mode_allows_tier1_tool(AgentMode::Plan, SEARCH_FILES));
+        assert!(!mode_allows_tier1_tool(AgentMode::Plan, WRITE_FILE));
+        assert!(!mode_allows_tier1_tool(AgentMode::Plan, EDIT_FILE));
+        assert!(!mode_allows_tier1_tool(AgentMode::Plan, DELETE_FILE));
+        assert!(!mode_allows_tier1_tool(AgentMode::Plan, DELETE_DIRECTORY));
+        assert!(!mode_allows_tier1_tool(
+            AgentMode::Plan,
+            GET_CURRENT_WEATHER
+        ));
+        assert!(!mode_allows_tier2_tools(AgentMode::Plan));
+    }
+
+    #[test]
+    fn build_mode_allows_all_registered_tool_tiers() {
+        for tool in registry() {
+            assert!(mode_allows_tier1_tool(AgentMode::Build, tool.name));
+        }
+        assert!(mode_allows_tier2_tools(AgentMode::Build));
     }
 
     #[test]

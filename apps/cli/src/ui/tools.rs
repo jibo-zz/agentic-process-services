@@ -631,7 +631,7 @@ fn push_result_lines(result: &ToolEditorResult, lines: &mut Vec<Line>) {
 }
 
 fn render_footer(app: &App, area: Rect, buf: &mut Buffer, editor: bool) {
-    let spans = if editor {
+    let mut spans = if editor {
         if matches!(app.tool_editor.generation, GenerationState::Generated) {
             vec![
                 " REVIEW ".bold().on_dark_gray(),
@@ -677,6 +677,9 @@ fn render_footer(app: &App, area: Rect, buf: &mut Buffer, editor: bool) {
             "back".dim(),
         ]
     };
+    spans.insert(2, "  ".into());
+    spans.insert(2, app.active_mode().label().dim());
+    spans.insert(2, "MODE ".bold().green());
     Paragraph::new(Line::from(spans))
         .alignment(Alignment::Center)
         .render(area, buf);

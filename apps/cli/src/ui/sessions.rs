@@ -27,7 +27,7 @@ impl Widget for SessionsScreen<'_> {
             .areas(page);
 
         render_list(self.app, list_area, buf);
-        render_footer(footer, buf);
+        render_footer(self.app, footer, buf);
     }
 }
 
@@ -107,9 +107,12 @@ fn render_list(app: &App, area: Rect, buf: &mut Buffer) {
         .render(area, buf);
 }
 
-fn render_footer(area: Rect, buf: &mut Buffer) {
+fn render_footer(app: &App, area: Rect, buf: &mut Buffer) {
     Paragraph::new(Line::from(vec![
         " SESSIONS ".bold().on_dark_gray(),
+        "  ".into(),
+        "MODE ".bold().green(),
+        app.active_mode().label().dim(),
         "  ".into(),
         "↑↓ ".bold().cyan(),
         "navigate ".dim(),

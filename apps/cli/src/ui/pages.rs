@@ -142,6 +142,9 @@ fn render_footer(app: &App, area: Rect, buf: &mut Buffer) {
     Paragraph::new(Line::from(vec![
         " PAGE ".bold().on_dark_gray(),
         format!(" {} ", app.route().label()).dim(),
+        "MODE ".bold().green(),
+        app.active_mode().label().dim(),
+        "  ".into(),
         "/home ".bold().cyan(),
         "ESC ".bold().magenta(),
         "quit".dim(),

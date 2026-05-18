@@ -1,7 +1,7 @@
 use agentic_config::DEFAULT_SERVER_ADDR;
 use agentic_protocol::{
-    AUTHOR_STREAM_PATH, AuthorRequest, CHAT_STREAM_PATH, ChatRequest, ChatStreamEvent, DeleteAck,
-    DeleteToolParams, DeleteVersionParams, HealthResponse, RPC_HEALTH_CHECK, RPC_PATH,
+    AUTHOR_STREAM_PATH, AgentMode, AuthorRequest, CHAT_STREAM_PATH, ChatRequest, ChatStreamEvent,
+    DeleteAck, DeleteToolParams, DeleteVersionParams, HealthResponse, RPC_HEALTH_CHECK, RPC_PATH,
     RPC_SESSIONS_GET, RPC_SESSIONS_LIST, RPC_TOOLS_DELETE_TOOL, RPC_TOOLS_DELETE_VERSION,
     RPC_TOOLS_LIST, RPC_TOOLS_MANAGEMENT, RPC_TOOLS_REGISTER, RPC_TOOLS_RESULT,
     RPC_TOOLS_SAVE_DRAFT, RegisterParams, RpcError, RpcRequest, RpcResponse, SaveDraftParams,
@@ -189,6 +189,7 @@ impl Fetcher {
         &self,
         session_id: &str,
         message: &str,
+        mode: AgentMode,
     ) -> Result<impl Stream<Item = Result<ChatStreamEvent, FetchError>>, FetchError> {
         let response = self
             .http
@@ -196,6 +197,7 @@ impl Fetcher {
             .json(&ChatRequest {
                 session_id: session_id.to_owned(),
                 message: message.to_owned(),
+                mode,
             })
             .send()
             .await?;

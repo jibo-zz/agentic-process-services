@@ -16,7 +16,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let page = centered_rect(area, 92, area.height.saturating_sub(2).max(10));
     let [history, input, footer] = Layout::vertical([
         Constraint::Fill(1),
-        Constraint::Length(3),
+        Constraint::Length(5),
         Constraint::Length(1),
     ])
     .spacing(1)
@@ -24,7 +24,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     render_history(app, history, frame.buffer_mut());
     let cursor_pos = render_input(app, input, frame.buffer_mut());
-    render_footer(footer, frame.buffer_mut());
+    render_footer(app, footer, frame.buffer_mut());
 
     if let Some(pos) = cursor_pos {
         frame.set_cursor_position(pos);
@@ -266,22 +266,44 @@ fn render_input(app: &App, area: Rect, buf: &mut Buffer) -> Option<Position> {
         app.chat_stream,
         ChatStream::Streaming { .. } | ChatStream::Pending(_)
     );
+    let block = Block::bordered()
+        .title_top(Line::from(vec![
+            "  > ".green(),
+            "Message ".bold(),
+            "[ MODE: ".dim(),
+            app.active_mode().label().bold().cyan(),
+            " ] ".dim(),
+        ]))
+        .title_bottom(
+            Line::from(format!(" {} ", app.text_area_key_bindings_hint()))
+                .right_aligned()
+                .dim(),
+        )
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().cyan())
+        .padding(Padding::new(1, 1, 0, 0));
+    let inner = block.inner(area);
+
     let text = if is_busy {
         Text::from(Line::from("waiting for response...".dim()))
     } else if app.input().is_empty() {
         Text::from(Line::from("> Type a message...".dim()))
     } else {
+        let display = app
+            .input()
+            .split('\n')
+            .map(|line| format!("> {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         Text::from(
-            app.input()
-                .split('\n')
-                .map(|line| Line::from(format!("> {line}")))
+            super::wrap_chars(&display, inner.width)
+                .into_iter()
+                .map(Line::from)
                 .collect::<Vec<_>>(),
         )
     };
 
-    Paragraph::new(text)
-        .wrap(Wrap { trim: false })
-        .render(area, buf);
+    Paragraph::new(text).block(block).render(area, buf);
 
     if is_busy {
         return None;
@@ -292,16 +314,21 @@ fn render_input(app: &App, area: Rect, buf: &mut Buffer) -> Option<Position> {
         .map(|line| format!("> {line}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let (cx, cy) = super::caret_xy(&displayed_head, area.width);
-    Some(Position::new(area.x + cx, area.y + cy))
+    let (cx, cy) = super::caret_xy(&displayed_head, inner.width);
+    Some(Position::new(inner.x + cx, inner.y + cy))
 }
 
-fn render_footer(area: Rect, buf: &mut Buffer) {
+fn render_footer(app: &App, area: Rect, buf: &mut Buffer) {
     Paragraph::new(Line::from(vec![
         " CHAT ".bold().on_dark_gray(),
         "  ".into(),
+        "MODE ".bold().green(),
+        app.active_mode().label().dim(),
+        "  ".into(),
         "↑↓ ".bold().cyan(),
         "scroll ".dim(),
+        "SHIFT+TAB ".bold().cyan(),
+        "mode ".dim(),
         "/sessions ".bold().cyan(),
         "history ".dim(),
         "debug:tool-stream ".bold().cyan(),
