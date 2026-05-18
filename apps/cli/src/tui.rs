@@ -1,5 +1,8 @@
 use crate::{
-    app::{App, PendingToolApproval},
+    app::{
+        App, PendingToolApproval, ToolEditorAction, ToolEditorResult, ToolEditorResultKind,
+        ToolEditorSnapshot,
+    },
     ui,
 };
 use color_eyre::eyre::Result;
@@ -24,7 +27,8 @@ const CURSOR_COLOR_RESET: &str = "\x1b]112\x07";
 
 use crate::app::Route;
 use agentic_protocol::{
-    ChatStreamEvent, SessionSummary, ToolResultParams, ToolsListResponse, UiMessage,
+    ChatStreamEvent, LocalToolScript, SaveDraftParams, SessionSummary, ToolResultParams, ToolRisk,
+    ToolVersionRow, ToolsListResponse, UiMessage,
 };
 use agentic_tools::WorkspaceGuard;
 use cli::client::{FetchError, Fetcher};
@@ -40,6 +44,13 @@ enum ChatEvent {
     },
     Done,
     Err(String),
+}
+
+enum EditorEvent {
+    RunResult(ToolEditorResult),
+    DraftSaved { row: ToolVersionRow },
+    Registered { row: ToolVersionRow },
+    Error(String),
 }
 
 type SessionsOpenResult = Result<(String, Vec<UiMessage>), FetchError>;
@@ -63,6 +74,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
     let mut sessions_rx: Option<mpsc::Receiver<Result<Vec<SessionSummary>, FetchError>>> = None;
     let mut sessions_open_rx: Option<mpsc::Receiver<SessionsOpenResult>> = None;
     let mut tools_rx: Option<mpsc::Receiver<ToolsListResult>> = None;
+    let mut editor_rx: Option<mpsc::Receiver<EditorEvent>> = None;
 
     loop {
         // Spawn sessions list load when navigating to Sessions for the first time.
@@ -190,6 +202,57 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
             tools_rx = None;
         }
 
+        // Drain editor task results.
+        if let Some(ref rx) = editor_rx {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    EditorEvent::RunResult(result) => app.set_editor_result(result),
+                    EditorEvent::DraftSaved { row } => {
+                        app.set_last_draft_version_id(row.id.clone());
+                        app.set_editor_result(ToolEditorResult {
+                            kind: ToolEditorResultKind::Success,
+                            message: format!("Saved draft v{} ({})", row.version, row.id),
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            exit_code: None,
+                            duration_ms: 0,
+                        });
+                    }
+                    EditorEvent::Registered { row } => {
+                        app.set_editor_result(ToolEditorResult {
+                            kind: ToolEditorResultKind::Success,
+                            message: format!(
+                                "Registered '{}' v{} as active",
+                                short_id(&row.tool_id),
+                                row.version
+                            ),
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            exit_code: None,
+                            duration_ms: 0,
+                        });
+                        // refresh the tools list so the new tool surfaces in the table
+                        let (tx, rx) = mpsc::channel();
+                        tools_rx = Some(rx);
+                        let f = fetcher.clone();
+                        runtime.spawn(async move {
+                            let _ = tx.send(f.tools_list().await);
+                        });
+                    }
+                    EditorEvent::Error(message) => {
+                        app.set_editor_result(ToolEditorResult {
+                            kind: ToolEditorResultKind::Failure,
+                            message,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            exit_code: None,
+                            duration_ms: 0,
+                        });
+                    }
+                }
+            }
+        }
+
         // Drain pending chat events before rendering.
         if let Some(ref rx) = chat_rx {
             while let Ok(event) = rx.try_recv() {
@@ -256,6 +319,21 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                             approved,
                         );
                     }
+                    if let Some(action) = app.take_pending_editor_action() {
+                        let snapshot = app.editor_snapshot();
+                        if editor_rx.is_none() {
+                            let (tx, rx) = mpsc::channel();
+                            editor_rx = Some(rx);
+                            dispatch_editor_action(
+                                &runtime,
+                                &fetcher,
+                                &workspace_guard,
+                                tx,
+                                action,
+                                snapshot,
+                            );
+                        }
+                    }
                     if should_quit {
                         break;
                     }
@@ -293,20 +371,26 @@ fn handle_chat_stream_event(
             input,
             approval_required,
             summary: _,
+            script,
         } => {
             if approval_required {
-                let summary = agentic_tools::approval_summary(&name, &input, workspace_guard);
+                let summary = match &script {
+                    Some(_) => format!("Run {name}?"),
+                    None => agentic_tools::approval_summary(&name, &input, workspace_guard),
+                };
                 app.apply_chat_stream_event(ChatStreamEvent::LocalToolRequest {
                     invocation_id: invocation_id.clone(),
                     name: name.clone(),
                     input: input.clone(),
                     approval_required,
                     summary,
+                    script: None,
                 });
                 app.set_pending_tool_approval(PendingToolApproval {
                     invocation_id,
                     name,
                     input,
+                    script,
                 });
                 return;
             }
@@ -321,18 +405,34 @@ fn handle_chat_stream_event(
                 return;
             };
             if let Some(tx) = chat_tx.cloned() {
-                spawn_local_tool(
-                    runtime,
-                    fetcher.clone(),
-                    workspace_guard.clone(),
-                    tx,
-                    stream_id,
-                    stream_secret,
-                    invocation_id,
-                    name,
-                    input,
-                    false,
-                );
+                if let Some(script) = script {
+                    spawn_tier2_tool(
+                        runtime,
+                        fetcher.clone(),
+                        workspace_guard.clone(),
+                        tx,
+                        stream_id,
+                        stream_secret,
+                        invocation_id,
+                        name,
+                        input,
+                        script,
+                        false,
+                    );
+                } else {
+                    spawn_local_tool(
+                        runtime,
+                        fetcher.clone(),
+                        workspace_guard.clone(),
+                        tx,
+                        stream_id,
+                        stream_secret,
+                        invocation_id,
+                        name,
+                        input,
+                        false,
+                    );
+                }
             }
         }
         event => app.apply_chat_stream_event(event),
@@ -361,18 +461,34 @@ fn handle_tool_approval_decision(
         return;
     };
     if approved {
-        spawn_local_tool(
-            runtime,
-            fetcher.clone(),
-            workspace_guard.clone(),
-            tx,
-            stream_id,
-            stream_secret,
-            approval.invocation_id,
-            approval.name,
-            approval.input,
-            true,
-        );
+        if let Some(script) = approval.script {
+            spawn_tier2_tool(
+                runtime,
+                fetcher.clone(),
+                workspace_guard.clone(),
+                tx,
+                stream_id,
+                stream_secret,
+                approval.invocation_id,
+                approval.name,
+                approval.input,
+                script,
+                true,
+            );
+        } else {
+            spawn_local_tool(
+                runtime,
+                fetcher.clone(),
+                workspace_guard.clone(),
+                tx,
+                stream_id,
+                stream_secret,
+                approval.invocation_id,
+                approval.name,
+                approval.input,
+                true,
+            );
+        }
     } else {
         spawn_tool_result_callback(
             runtime,
@@ -404,6 +520,41 @@ fn spawn_local_tool(
 ) {
     runtime.spawn(async move {
         let result = local_tools::execute(&guard, &name, input);
+        let (output, error) = match result {
+            Ok(output) => (Some(output), None),
+            Err(error) => (None, Some(error)),
+        };
+        send_tool_result(
+            fetcher,
+            tx,
+            stream_id,
+            stream_secret,
+            invocation_id,
+            name,
+            output,
+            error,
+            render_ui,
+        )
+        .await;
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_tier2_tool(
+    runtime: &tokio::runtime::Runtime,
+    fetcher: Fetcher,
+    guard: WorkspaceGuard,
+    tx: mpsc::Sender<ChatEvent>,
+    stream_id: String,
+    stream_secret: String,
+    invocation_id: String,
+    name: String,
+    input: serde_json::Value,
+    script: LocalToolScript,
+    render_ui: bool,
+) {
+    runtime.spawn(async move {
+        let result = local_tools::execute_tier2(&guard, input, script).await;
         let (output, error) = match result {
             Ok(output) => (Some(output), None),
             Err(error) => (None, Some(error)),
@@ -496,6 +647,153 @@ async fn send_tool_result(
 
 fn stream_auth(app: &App) -> Option<(String, String)> {
     Some((app.stream_id.clone()?, app.stream_secret.clone()?))
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+fn dispatch_editor_action(
+    runtime: &tokio::runtime::Runtime,
+    fetcher: &Fetcher,
+    workspace_guard: &WorkspaceGuard,
+    tx: mpsc::Sender<EditorEvent>,
+    action: ToolEditorAction,
+    snapshot: ToolEditorSnapshot,
+) {
+    match action {
+        ToolEditorAction::Run => spawn_editor_run(runtime, workspace_guard.clone(), tx, snapshot),
+        ToolEditorAction::SaveDraft => {
+            spawn_editor_save_draft(runtime, fetcher.clone(), tx, snapshot)
+        }
+        ToolEditorAction::Register => spawn_editor_register(runtime, fetcher.clone(), tx, snapshot),
+    }
+}
+
+fn spawn_editor_run(
+    runtime: &tokio::runtime::Runtime,
+    guard: WorkspaceGuard,
+    tx: mpsc::Sender<EditorEvent>,
+    snapshot: ToolEditorSnapshot,
+) {
+    runtime.spawn(async move {
+        if snapshot.script.trim().is_empty() {
+            let _ = tx.send(EditorEvent::Error("Script is empty.".to_owned()));
+            return;
+        }
+        let args: serde_json::Value = serde_json::from_str(&snapshot.args)
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+        let script = LocalToolScript {
+            language: snapshot.language,
+            script: snapshot.script,
+            timeout_ms: 10_000,
+        };
+        match local_tools::execute_tier2(&guard, args, script).await {
+            Ok(value) => {
+                let stdout = value
+                    .get("stdout")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let stderr = value
+                    .get("stderr")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let exit_code = value
+                    .get("exit_code")
+                    .and_then(|v| v.as_i64())
+                    .map(|n| n as i32);
+                let duration_ms = value
+                    .get("duration_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let message = format!("Ran in {duration_ms}ms");
+                let _ = tx.send(EditorEvent::RunResult(ToolEditorResult {
+                    kind: ToolEditorResultKind::Success,
+                    message,
+                    stdout,
+                    stderr,
+                    exit_code,
+                    duration_ms,
+                }));
+            }
+            Err(error) => {
+                let _ = tx.send(EditorEvent::RunResult(ToolEditorResult {
+                    kind: ToolEditorResultKind::Failure,
+                    message: error,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: None,
+                    duration_ms: 0,
+                }));
+            }
+        }
+    });
+}
+
+fn spawn_editor_save_draft(
+    runtime: &tokio::runtime::Runtime,
+    fetcher: Fetcher,
+    tx: mpsc::Sender<EditorEvent>,
+    snapshot: ToolEditorSnapshot,
+) {
+    runtime.spawn(async move {
+        if snapshot.name.is_empty() {
+            let _ = tx.send(EditorEvent::Error("Tool name is required.".to_owned()));
+            return;
+        }
+        if snapshot.script.trim().is_empty() {
+            let _ = tx.send(EditorEvent::Error("Script is empty.".to_owned()));
+            return;
+        }
+        let args_schema: serde_json::Value = serde_json::from_str(&snapshot.args)
+            .unwrap_or_else(|_| serde_json::json!({ "type": "object" }));
+        let params = SaveDraftParams {
+            name: snapshot.name.clone(),
+            description: format!("Tier-2 tool '{}'", snapshot.name),
+            language: snapshot.language,
+            script: snapshot.script,
+            args_schema,
+            output_schema: None,
+            tests: Vec::new(),
+            risk: ToolRisk::ReadOnly,
+            timeout_ms: 10_000,
+            owner: "scratchpad".to_owned(),
+        };
+        match fetcher.tools_save_draft(params).await {
+            Ok(row) => {
+                let _ = tx.send(EditorEvent::DraftSaved { row });
+            }
+            Err(error) => {
+                let _ = tx.send(EditorEvent::Error(format!("Save draft failed: {error}")));
+            }
+        }
+    });
+}
+
+fn spawn_editor_register(
+    runtime: &tokio::runtime::Runtime,
+    fetcher: Fetcher,
+    tx: mpsc::Sender<EditorEvent>,
+    snapshot: ToolEditorSnapshot,
+) {
+    runtime.spawn(async move {
+        let Some(version_id) = snapshot.last_draft_version_id else {
+            let _ = tx.send(EditorEvent::Error(
+                "Save a draft first (Ctrl+S), then publish.".to_owned(),
+            ));
+            return;
+        };
+        match fetcher.tools_register(version_id).await {
+            Ok(row) => {
+                let _ = tx.send(EditorEvent::Registered { row });
+            }
+            Err(error) => {
+                let _ = tx.send(EditorEvent::Error(format!("Register failed: {error}")));
+            }
+        }
+    });
 }
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {

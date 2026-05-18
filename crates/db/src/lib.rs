@@ -8,7 +8,7 @@ use sea_orm::{
     sea_query::TableCreateStatement,
 };
 
-use entity::{message, session};
+use entity::{message, session, tool, tool_version};
 
 pub async fn connect(url: &str) -> Result<DatabaseConnection, DbErr> {
     let mut opt = ConnectOptions::new(url);
@@ -31,16 +31,27 @@ async fn sync_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
             .create_table_from_entity(message::Entity)
             .if_not_exists()
             .to_owned(),
+        schema
+            .create_table_from_entity(tool::Entity)
+            .if_not_exists()
+            .to_owned(),
+        schema
+            .create_table_from_entity(tool_version::Entity)
+            .if_not_exists()
+            .to_owned(),
     ];
 
     for stmt in stmts {
         db.execute(&stmt).await?;
     }
 
-    // Index for efficient per-session message loading
     if backend == DatabaseBackend::Postgres {
         db.execute_unprepared(
             "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, position)",
+        )
+        .await?;
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_tool_versions_tool ON tool_versions(tool_id, version)",
         )
         .await?;
     }

@@ -10,6 +10,10 @@ pub const RPC_SESSIONS_LIST: &str = "sessions.list";
 pub const RPC_SESSIONS_GET: &str = "sessions.get";
 pub const RPC_TOOLS_LIST: &str = "tools.list";
 pub const RPC_TOOLS_RESULT: &str = "tools.result";
+pub const RPC_TOOLS_MANAGEMENT: &str = "tools.management";
+pub const RPC_TOOLS_SAVE_DRAFT: &str = "tools.save_draft";
+pub const RPC_TOOLS_REGISTER: &str = "tools.register";
+pub const RPC_TOOLS_DELETE_VERSION: &str = "tools.delete_version";
 pub const CHAT_STREAM_PATH: &str = "/chat/stream";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,8 +77,6 @@ pub struct ToolDescriptor {
 pub struct ToolsListResponse {
     pub tools: Vec<ToolDescriptor>,
 }
-
-pub const LLM_PREAMBLE: &str = "You are usful assistance.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiMessage {
@@ -269,11 +271,117 @@ pub enum ChatStreamEvent {
         input: Value,
         approval_required: bool,
         summary: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        script: Option<LocalToolScript>,
     },
     Error {
         message: String,
     },
     MessageDone,
+}
+
+/// Tier-2 (DB-authored) tool payload carried inline with a `LocalToolRequest` so
+/// the CLI can execute the script via the subprocess runner without an extra round-trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalToolScript {
+    pub language: ToolScriptLanguage,
+    pub script: String,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolScriptLanguage {
+    Python,
+    Shell,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolVersionStatus {
+    Draft,
+    Active,
+    Deprecated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ToolTestCase {
+    pub name: String,
+    #[serde(default)]
+    pub args: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_stdout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_exit: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_contains: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolVersionRow {
+    pub id: String,
+    pub tool_id: String,
+    pub version: i32,
+    pub language: ToolScriptLanguage,
+    pub script: String,
+    pub args_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    #[serde(default)]
+    pub tests: Vec<ToolTestCase>,
+    pub status: ToolVersionStatus,
+    pub risk: ToolRisk,
+    pub timeout_ms: i32,
+    pub description: String,
+    pub created_at_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolRow {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_version_id: Option<String>,
+    pub owner: String,
+    pub updated_at_secs: u64,
+    pub versions: Vec<ToolVersionRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolsManagementResponse {
+    pub tools: Vec<ToolRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaveDraftParams {
+    pub name: String,
+    pub description: String,
+    pub language: ToolScriptLanguage,
+    pub script: String,
+    pub args_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    #[serde(default)]
+    pub tests: Vec<ToolTestCase>,
+    pub risk: ToolRisk,
+    pub timeout_ms: i32,
+    #[serde(default)]
+    pub owner: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterParams {
+    pub version_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteVersionParams {
+    pub version_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteAck {
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

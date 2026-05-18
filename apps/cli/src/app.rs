@@ -1,7 +1,7 @@
 use crate::sessions::Session;
 use agentic_protocol::{
-    ChatStreamEvent, SessionSummary, ToolDescriptor, ToolExecutionKind, ToolState, UiMessage,
-    UiPart, UiRole,
+    ChatStreamEvent, LocalToolScript, SessionSummary, ToolDescriptor, ToolExecutionKind,
+    ToolScriptLanguage, ToolState, UiMessage, UiPart, UiRole,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{BTreeSet, HashMap};
@@ -11,6 +11,8 @@ pub struct PendingToolApproval {
     pub invocation_id: String,
     pub name: String,
     pub input: serde_json::Value,
+    /// For Tier-2 (DB-authored) tools, the script body to run on approval. None for Tier-1.
+    pub script: Option<LocalToolScript>,
 }
 
 /// Single-buffer text input with a UTF-8 safe caret. Used for both the
@@ -22,6 +24,11 @@ pub struct TextField {
 }
 
 impl TextField {
+    pub fn from_initial(value: impl Into<String>) -> Self {
+        let value = value.into();
+        let caret = value.len();
+        Self { value, caret }
+    }
     pub fn as_str(&self) -> &str {
         &self.value
     }
@@ -129,6 +136,87 @@ pub struct ToolDashboardItem {
     pub availability: ToolAvailability,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolEditorField {
+    Name,
+    Script,
+    Args,
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolEditorResult {
+    pub kind: ToolEditorResultKind,
+    pub message: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+    pub duration_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolEditorResultKind {
+    Success,
+    Failure,
+}
+
+#[derive(Clone, Default)]
+pub struct ToolEditor {
+    pub open: bool,
+    pub field: Option<ToolEditorField>,
+    pub name: TextField,
+    pub language: ToolEditorLanguage,
+    pub script: TextField,
+    pub args: TextField,
+    pub last_draft_version_id: Option<String>,
+    pub last_result: Option<ToolEditorResult>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ToolEditorLanguage {
+    #[default]
+    Python,
+    Shell,
+}
+
+impl ToolEditorLanguage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Python => "python",
+            Self::Shell => "shell",
+        }
+    }
+
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Python => Self::Shell,
+            Self::Shell => Self::Python,
+        }
+    }
+
+    pub fn to_protocol(self) -> ToolScriptLanguage {
+        match self {
+            Self::Python => ToolScriptLanguage::Python,
+            Self::Shell => ToolScriptLanguage::Shell,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum ToolEditorAction {
+    Run,
+    SaveDraft,
+    Register,
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolEditorSnapshot {
+    pub name: String,
+    pub language: ToolScriptLanguage,
+    pub script: String,
+    pub args: String,
+    pub last_draft_version_id: Option<String>,
+}
+
 #[derive(Default)]
 pub enum ChatStream {
     #[default]
@@ -232,9 +320,9 @@ pub struct App {
     pub tools: Vec<ToolDashboardItem>,
     pub tools_loaded: bool,
     pub tools_cursor: usize,
-    pub tools_input: TextField,
-    pub tools_input_focused: bool,
     pub tools_notice: Option<String>,
+    pub tool_editor: ToolEditor,
+    pending_editor_action: Option<ToolEditorAction>,
 }
 
 impl App {
@@ -319,6 +407,7 @@ impl App {
                 input: _,
                 approval_required,
                 summary,
+                script: _,
             } => {
                 let state = if approval_required {
                     ToolState::AwaitingApproval
@@ -435,8 +524,8 @@ impl App {
                 self.route = Route::Home;
                 false
             }
-            KeyCode::Esc if matches!(self.route, Route::Tools) && self.tools_input_focused => {
-                self.tools_input_focused = false;
+            KeyCode::Esc if matches!(self.route, Route::Tools) && self.tool_editor.open => {
+                self.close_tool_editor();
                 false
             }
             KeyCode::Esc if matches!(self.route, Route::Tools) => {
@@ -485,57 +574,22 @@ impl App {
                 false
             }
 
-            // Tools dashboard navigation and proposal input shell
-            KeyCode::Up if matches!(self.route, Route::Tools) && !self.tools_input_focused => {
+            // Tools dashboard navigation and editor
+            _ if matches!(self.route, Route::Tools) && self.tool_editor.open => {
+                self.handle_tool_editor_key(key);
+                false
+            }
+            KeyCode::Up if matches!(self.route, Route::Tools) => {
                 self.tools_cursor = self.tools_cursor.saturating_sub(1);
                 false
             }
-            KeyCode::Down if matches!(self.route, Route::Tools) && !self.tools_input_focused => {
+            KeyCode::Down if matches!(self.route, Route::Tools) => {
                 let max = self.tools.len().saturating_sub(1);
                 self.tools_cursor = (self.tools_cursor + 1).min(max);
                 false
             }
-            KeyCode::Char('n') | KeyCode::Char('N')
-                if matches!(self.route, Route::Tools) && !self.tools_input_focused =>
-            {
-                self.tools_input_focused = true;
-                self.tools_notice = None;
-                false
-            }
-            KeyCode::Enter if matches!(self.route, Route::Tools) && self.tools_input_focused => {
-                self.submit_tool_request();
-                false
-            }
-            KeyCode::Backspace
-                if matches!(self.route, Route::Tools) && self.tools_input_focused =>
-            {
-                self.tools_input.backspace();
-                false
-            }
-            KeyCode::Delete
-                if matches!(self.route, Route::Tools) && self.tools_input_focused =>
-            {
-                self.tools_input.delete_forward();
-                false
-            }
-            KeyCode::Left if matches!(self.route, Route::Tools) && self.tools_input_focused => {
-                self.tools_input.move_left();
-                false
-            }
-            KeyCode::Right if matches!(self.route, Route::Tools) && self.tools_input_focused => {
-                self.tools_input.move_right();
-                false
-            }
-            KeyCode::Home if matches!(self.route, Route::Tools) && self.tools_input_focused => {
-                self.tools_input.move_home();
-                false
-            }
-            KeyCode::End if matches!(self.route, Route::Tools) && self.tools_input_focused => {
-                self.tools_input.move_end();
-                false
-            }
-            KeyCode::Char(c) if matches!(self.route, Route::Tools) && self.tools_input_focused => {
-                self.tools_input.insert_char(c);
+            KeyCode::Char('n') | KeyCode::Char('N') if matches!(self.route, Route::Tools) => {
+                self.open_tool_editor();
                 false
             }
 
@@ -647,7 +701,7 @@ impl App {
             }
             "tools" => {
                 self.tools_cursor = 0;
-                self.tools_input_focused = false;
+                self.close_tool_editor();
                 self.route = Route::Tools;
             }
             _ => self.route = Route::Missing(format!("/{command}")),
@@ -717,14 +771,110 @@ impl App {
         self.tools_notice = Some(message.into());
     }
 
-    fn submit_tool_request(&mut self) {
-        let request = self.tools_input.as_str().trim().to_owned();
-        if request.is_empty() {
-            return;
+    fn open_tool_editor(&mut self) {
+        self.tools_notice = None;
+        self.tool_editor.open = true;
+        self.tool_editor.field = Some(ToolEditorField::Name);
+        if self.tool_editor.args.is_empty() {
+            // sensible default so the user sees the shape of ARGS_JSON.
+            self.tool_editor.args = TextField::from_initial("{}");
         }
-        self.tools_notice = Some(format!("Tool proposal queued for a later phase: {request}"));
-        self.tools_input.clear();
-        self.tools_input_focused = false;
+    }
+
+    pub fn close_tool_editor(&mut self) {
+        self.tool_editor.open = false;
+        self.tool_editor.field = None;
+    }
+
+    pub fn take_pending_editor_action(&mut self) -> Option<ToolEditorAction> {
+        self.pending_editor_action.take()
+    }
+
+    pub fn set_editor_result(&mut self, result: ToolEditorResult) {
+        self.tool_editor.last_result = Some(result);
+    }
+
+    pub fn set_last_draft_version_id(&mut self, version_id: String) {
+        self.tool_editor.last_draft_version_id = Some(version_id);
+    }
+
+    pub fn editor_snapshot(&self) -> ToolEditorSnapshot {
+        ToolEditorSnapshot {
+            name: self.tool_editor.name.as_str().trim().to_owned(),
+            language: self.tool_editor.language.to_protocol(),
+            script: self.tool_editor.script.as_str().to_owned(),
+            args: self.tool_editor.args.as_str().to_owned(),
+            last_draft_version_id: self.tool_editor.last_draft_version_id.clone(),
+        }
+    }
+
+    fn handle_tool_editor_key(&mut self, key: KeyEvent) {
+        // Action shortcuts (Ctrl-keyed) work regardless of focused field.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.pending_editor_action = Some(ToolEditorAction::Run);
+                    return;
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    self.pending_editor_action = Some(ToolEditorAction::SaveDraft);
+                    return;
+                }
+                KeyCode::Char('p') | KeyCode::Char('P') => {
+                    self.pending_editor_action = Some(ToolEditorAction::Register);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        match key.code {
+            KeyCode::Tab => self.editor_focus_next(),
+            KeyCode::BackTab => self.editor_focus_prev(),
+            KeyCode::F(2) => self.tool_editor.language = self.tool_editor.language.toggle(),
+            KeyCode::Enter if matches!(self.tool_editor.field, Some(ToolEditorField::Script)) => {
+                self.tool_editor.script.insert_char('\n');
+            }
+            _ => self.editor_field_key(key),
+        }
+    }
+
+    fn editor_focus_next(&mut self) {
+        self.tool_editor.field = Some(match self.tool_editor.field {
+            None => ToolEditorField::Name,
+            Some(ToolEditorField::Name) => ToolEditorField::Script,
+            Some(ToolEditorField::Script) => ToolEditorField::Args,
+            Some(ToolEditorField::Args) => ToolEditorField::Name,
+        });
+    }
+
+    fn editor_focus_prev(&mut self) {
+        self.tool_editor.field = Some(match self.tool_editor.field {
+            None => ToolEditorField::Args,
+            Some(ToolEditorField::Name) => ToolEditorField::Args,
+            Some(ToolEditorField::Script) => ToolEditorField::Name,
+            Some(ToolEditorField::Args) => ToolEditorField::Script,
+        });
+    }
+
+    fn editor_field_key(&mut self, key: KeyEvent) {
+        let Some(field) = self.tool_editor.field else {
+            return;
+        };
+        let target: &mut TextField = match field {
+            ToolEditorField::Name => &mut self.tool_editor.name,
+            ToolEditorField::Script => &mut self.tool_editor.script,
+            ToolEditorField::Args => &mut self.tool_editor.args,
+        };
+        match key.code {
+            KeyCode::Backspace => target.backspace(),
+            KeyCode::Delete => target.delete_forward(),
+            KeyCode::Left => target.move_left(),
+            KeyCode::Right => target.move_right(),
+            KeyCode::Home => target.move_home(),
+            KeyCode::End => target.move_end(),
+            KeyCode::Char(c) => target.insert_char(c),
+            _ => {}
+        }
     }
 
     fn open_selected_session(&mut self) {

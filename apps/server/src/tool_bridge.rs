@@ -1,4 +1,4 @@
-use agentic_protocol::{ChatStreamEvent, ToolResultAck, ToolResultParams};
+use agentic_protocol::{ChatStreamEvent, LocalToolScript, ToolResultAck, ToolResultParams};
 use serde_json::Value;
 use std::{collections::HashMap, error::Error, fmt, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -63,6 +63,7 @@ impl ToolBridge {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn request_local_tool(
         &self,
         auth: &StreamAuth,
@@ -71,6 +72,7 @@ impl ToolBridge {
         input: Value,
         approval_required: bool,
         summary: String,
+        script: Option<LocalToolScript>,
     ) -> Result<Value, BridgeError> {
         let invocation_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
@@ -86,6 +88,14 @@ impl ToolBridge {
             },
         );
 
+        // Tier-2 dispatches may sit awaiting user approval; allow a long ceiling but bound it
+        // so a never-acknowledged script can't pin the agent loop forever.
+        let timeout = if script.is_some() {
+            Duration::from_secs(600)
+        } else {
+            Duration::from_secs(120)
+        };
+
         if events
             .send(ChatStreamEvent::LocalToolRequest {
                 invocation_id,
@@ -93,6 +103,7 @@ impl ToolBridge {
                 input,
                 approval_required,
                 summary,
+                script,
             })
             .is_err()
         {
@@ -100,7 +111,7 @@ impl ToolBridge {
             return Err(BridgeError::ClientDisconnected);
         }
 
-        let result = tokio::time::timeout(Duration::from_secs(120), rx)
+        let result = tokio::time::timeout(timeout, rx)
             .await
             .map_err(|_| BridgeError::TimedOut)?
             .map_err(|_| BridgeError::ClientDisconnected)?;

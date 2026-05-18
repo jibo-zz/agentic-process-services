@@ -1,5 +1,5 @@
 use crate::tool_bridge::{StreamAuth, ToolBridge};
-use agentic_protocol::ChatStreamEvent;
+use agentic_protocol::{ChatStreamEvent, LocalToolScript, ToolScriptLanguage};
 use agentic_tools::{
     DELETE_DIRECTORY, DELETE_FILE, EDIT_FILE, LIST_FILES, READ_FILE, SEARCH_FILES, ToolExecution,
     WRITE_FILE,
@@ -116,7 +116,7 @@ impl LocalToolContext {
                 message: format!("'{name}' is not a local proxy tool"),
             });
         };
-        let summary = local_tool_summary(name, &input);
+        let summary = agentic_tools::stream_summary(name, &input);
         self.bridge
             .request_local_tool(
                 &self.auth,
@@ -125,6 +125,33 @@ impl LocalToolContext {
                 input,
                 approval_required,
                 summary,
+                None,
+            )
+            .await
+            .map_err(|error| ProxyToolError {
+                message: error.to_string(),
+            })
+    }
+
+    /// Dispatch a Tier-2 (DB-authored) tool call. The script body travels with the request so
+    /// the CLI can run it via the subprocess runner without an extra round-trip.
+    pub async fn call_tier2_tool(
+        &self,
+        name: String,
+        input: serde_json::Value,
+        approval_required: bool,
+        script: LocalToolScript,
+    ) -> Result<serde_json::Value, ProxyToolError> {
+        let summary = format!("Run {name}");
+        self.bridge
+            .request_local_tool(
+                &self.auth,
+                &self.events,
+                name,
+                input,
+                approval_required,
+                summary,
+                Some(script),
             )
             .await
             .map_err(|error| ProxyToolError {
@@ -189,26 +216,77 @@ proxy_tool!(EditFileProxyTool, EDIT_FILE);
 proxy_tool!(DeleteFileProxyTool, DELETE_FILE);
 proxy_tool!(DeleteDirectoryProxyTool, DELETE_DIRECTORY);
 
-fn local_tool_summary(name: &str, input: &serde_json::Value) -> String {
-    let path = input
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(".");
-    match name {
-        LIST_FILES => format!("List files under {path}"),
-        READ_FILE => format!("Read {path}"),
-        SEARCH_FILES => {
-            let query = input
-                .get("query")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            format!("Search {path} for '{query}'")
+/// Dynamic proxy for a DB-backed (Tier-2) tool. One instance per active DB tool is built per
+/// chat stream and registered with the Rig agent via `agent.tools(Vec<Box<dyn ToolDyn>>)`.
+/// Rig uses `name()` as the registration key, so the placeholder `NAME` constant is unused.
+#[derive(Debug, Clone)]
+pub struct DynamicProxyTool {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+    language: ToolScriptLanguage,
+    script: String,
+    timeout_ms: u64,
+    approval_required: bool,
+    context: LocalToolContext,
+}
+
+impl DynamicProxyTool {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        name: String,
+        description: String,
+        parameters: serde_json::Value,
+        language: ToolScriptLanguage,
+        script: String,
+        timeout_ms: u64,
+        approval_required: bool,
+        context: LocalToolContext,
+    ) -> Self {
+        Self {
+            name,
+            description,
+            parameters,
+            language,
+            script,
+            timeout_ms,
+            approval_required,
+            context,
         }
-        WRITE_FILE => format!("Write {path}"),
-        EDIT_FILE => format!("Edit {path}"),
-        DELETE_FILE => format!("Delete {path}"),
-        DELETE_DIRECTORY => format!("Delete directory {path}"),
-        _ => format!("Run {name}"),
+    }
+}
+
+impl Tool for DynamicProxyTool {
+    const NAME: &'static str = "_db_dynamic_proxy";
+    type Error = ProxyToolError;
+    type Args = serde_json::Value;
+    type Output = serde_json::Value;
+
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            parameters: self.parameters.clone(),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        self.context
+            .call_tier2_tool(
+                self.name.clone(),
+                args,
+                self.approval_required,
+                LocalToolScript {
+                    language: self.language,
+                    script: self.script.clone(),
+                    timeout_ms: self.timeout_ms,
+                },
+            )
+            .await
     }
 }
 

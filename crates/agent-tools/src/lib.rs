@@ -1,3 +1,6 @@
+pub mod instructions;
+pub mod runner;
+
 use agentic_protocol::{ToolDescriptor, ToolExecutionKind, ToolOutputPolicy, ToolRisk};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -494,6 +497,46 @@ pub fn sanitized_error(name: &str, error: &str) -> Value {
     serde_json::json!({ "summary": error, "tool": name })
 }
 
+pub fn sanitized_tool_value(value: &Value) -> Value {
+    let mut output = serde_json::Map::new();
+    for key in [
+        "summary",
+        "path",
+        "query",
+        "bytes",
+        "lines",
+        "truncated",
+        "overwritten",
+        "replacements",
+    ] {
+        if let Some(value) = value.get(key) {
+            output.insert(key.to_owned(), value.clone());
+        }
+    }
+    if output.is_empty() {
+        serde_json::json!({ "summary": "Tool event" })
+    } else {
+        Value::Object(output)
+    }
+}
+
+pub fn stream_summary(name: &str, input: &Value) -> String {
+    let path = input.get("path").and_then(Value::as_str).unwrap_or(".");
+    match name {
+        LIST_FILES => format!("List files under {path}"),
+        READ_FILE => format!("Read {path}"),
+        SEARCH_FILES => {
+            let query = input.get("query").and_then(Value::as_str).unwrap_or("");
+            format!("Search {path} for '{query}'")
+        }
+        WRITE_FILE => format!("Write {path}"),
+        EDIT_FILE => format!("Edit {path}"),
+        DELETE_FILE => format!("Delete {path}"),
+        DELETE_DIRECTORY => format!("Delete directory {path}"),
+        _ => format!("Run {name}"),
+    }
+}
+
 fn list_files(guard: &WorkspaceGuard, args: ListFilesArgs) -> Result<ListFilesOutput, ToolError> {
     let input_path = args.path.unwrap_or_else(|| ".".to_owned());
     let dir = guard.resolve_existing_dir(&input_path)?;
@@ -794,7 +837,7 @@ fn deny_sensitive_path(path: &Path) -> Result<(), ToolError> {
             continue;
         };
         let name = part.to_string_lossy();
-        if name == ".git" || name == "target" {
+        if name == ".git" || name == "target" || name == ".agent-tools" {
             return Err(ToolError::Denied(format!(
                 "'{name}' is not accessible to tools"
             )));
@@ -816,7 +859,7 @@ fn is_ignored_component(path: &Path) -> bool {
     path.components().any(|component| {
         matches!(component, Component::Normal(part) if {
             let name = part.to_string_lossy();
-            name == ".git" || name == "target" || name == "node_modules"
+            name == ".git" || name == "target" || name == "node_modules" || name == ".agent-tools"
         })
     })
 }

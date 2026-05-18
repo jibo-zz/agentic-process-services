@@ -2,12 +2,14 @@ mod tool_bridge;
 mod tools;
 
 use agentic_db::DatabaseConnection;
-use agentic_db::repo::{messages, sessions};
+use agentic_db::repo::{messages, sessions, tools as tool_repo};
 use agentic_protocol::{
-    CHAT_STREAM_PATH, ChatRequest, ChatStreamEvent, HealthResponse, LLM_PREAMBLE, RPC_HEALTH_CHECK,
-    RPC_PATH, RPC_SESSIONS_GET, RPC_SESSIONS_LIST, RPC_TOOLS_LIST, RPC_TOOLS_RESULT, RpcError,
-    RpcRequest, RpcResponse, ToolResultAck, ToolResultParams, ToolState, ToolsListResponse,
-    UiMessage, UiRole,
+    CHAT_STREAM_PATH, ChatRequest, ChatStreamEvent, DeleteAck, DeleteVersionParams, HealthResponse,
+    RPC_HEALTH_CHECK, RPC_PATH, RPC_SESSIONS_GET, RPC_SESSIONS_LIST, RPC_TOOLS_DELETE_VERSION,
+    RPC_TOOLS_LIST, RPC_TOOLS_MANAGEMENT, RPC_TOOLS_REGISTER, RPC_TOOLS_RESULT,
+    RPC_TOOLS_SAVE_DRAFT, RegisterParams, RpcError, RpcRequest, RpcResponse, SaveDraftParams,
+    ToolDescriptor, ToolExecutionKind, ToolOutputPolicy, ToolResultAck, ToolResultParams,
+    ToolState, ToolsListResponse, ToolsManagementResponse, UiMessage, UiRole,
 };
 use axum::{
     Json, Router,
@@ -128,9 +130,34 @@ async fn chat_stream(
     let (event_tx, event_rx) = mpsc::unbounded_channel::<ChatStreamEvent>();
     let local_tool_context =
         tools::LocalToolContext::new(state.bridge.clone(), stream_auth.clone(), event_tx.clone());
-    let preamble = format!(
-        "{LLM_PREAMBLE}\n\nYou are a coding agent. Use local file tools to inspect and modify the user's workspace instead of guessing, but keep research focused and answer once you have enough evidence. Use read_file before editing existing files. write_file, edit_file, delete_file, and delete_directory require user approval in the CLI. Use delete_file when the user asks to remove a file; use delete_directory only for empty directories. Do not empty a file as a substitute for deletion. Use get_current_weather for current weather questions; it defaults to celsius and should use fahrenheit only when explicitly requested."
-    );
+    let preamble = agentic_tools::instructions::coding_agent_preamble();
+
+    // Build dynamic proxies for every active DB-authored (Tier-2) tool so the agent sees them
+    // alongside the static registry without any rebuild/restart.
+    let db_tools = tool_repo::list_active(&state.db)
+        .await
+        .map_err(internal_error)?;
+    let dynamic_proxies: Vec<Box<dyn rig::tool::ToolDyn>> = db_tools
+        .into_iter()
+        .map(|(tool, version)| {
+            let approval_required = !matches!(
+                tool_repo::risk_from_str(&version.risk),
+                agentic_protocol::ToolRisk::ReadOnly
+            );
+            let language = tool_repo::language_from_str(&version.language);
+            Box::new(tools::DynamicProxyTool::new(
+                tool.name,
+                version.description,
+                version.args_schema,
+                language,
+                version.script,
+                version.timeout_ms.max(0) as u64,
+                approval_required,
+                local_tool_context.clone(),
+            )) as Box<dyn rig::tool::ToolDyn>
+        })
+        .collect();
+
     let agent = client
         .agent(deepseek::DEEPSEEK_V4_FLASH)
         .preamble(&preamble)
@@ -143,6 +170,7 @@ async fn chat_stream(
         .tool(tools::EditFileProxyTool::new(local_tool_context.clone()))
         .tool(tools::DeleteFileProxyTool::new(local_tool_context.clone()))
         .tool(tools::DeleteDirectoryProxyTool::new(local_tool_context))
+        .tools(dynamic_proxies)
         .build();
 
     let agent_stream = agent
@@ -225,8 +253,8 @@ fn sanitize_event_for_persistence(event: &ChatStreamEvent) -> ChatStreamEvent {
             id: id.clone(),
             name: name.clone(),
             state: *state,
-            input: input.as_ref().map(sanitize_tool_value),
-            output: output.as_ref().map(sanitize_tool_value),
+            input: input.as_ref().map(agentic_tools::sanitized_tool_value),
+            output: output.as_ref().map(agentic_tools::sanitized_tool_value),
             error: error.clone(),
         },
         ChatStreamEvent::LocalToolRequest {
@@ -241,35 +269,14 @@ fn sanitize_event_for_persistence(event: &ChatStreamEvent) -> ChatStreamEvent {
             input: serde_json::json!({ "summary": summary }),
             approval_required: *approval_required,
             summary: summary.clone(),
+            // Never persist the script body. UI history only carries the summary.
+            script: None,
         },
         ChatStreamEvent::StreamReady { .. } => ChatStreamEvent::StreamReady {
             stream_id: String::new(),
             stream_secret: String::new(),
         },
         event => event.clone(),
-    }
-}
-
-fn sanitize_tool_value(value: &serde_json::Value) -> serde_json::Value {
-    let mut output = serde_json::Map::new();
-    for key in [
-        "summary",
-        "path",
-        "query",
-        "bytes",
-        "lines",
-        "truncated",
-        "overwritten",
-        "replacements",
-    ] {
-        if let Some(value) = value.get(key) {
-            output.insert(key.to_owned(), value.clone());
-        }
-    }
-    if output.is_empty() {
-        serde_json::json!({ "summary": "Tool event" })
-    } else {
-        serde_json::Value::Object(output)
     }
 }
 
@@ -509,11 +516,139 @@ async fn rpc(
             }
         }
         RPC_TOOLS_LIST => {
-            let value = serde_json::to_value(ToolsListResponse {
-                tools: agentic_tools::descriptors(),
-            })
-            .unwrap_or_else(|_| serde_json::json!({ "tools": [] }));
+            let mut descriptors = agentic_tools::descriptors();
+            match tool_repo::list_active(&state.db).await {
+                Ok(db_tools) => {
+                    for (tool, version) in db_tools {
+                        let risk = tool_repo::risk_from_str(&version.risk);
+                        let approval_required =
+                            !matches!(risk, agentic_protocol::ToolRisk::ReadOnly);
+                        descriptors.push(ToolDescriptor {
+                            name: tool.name,
+                            description: version.description,
+                            execution: ToolExecutionKind::LocalProxy,
+                            approval_required,
+                            risk,
+                            output_policy: ToolOutputPolicy::SummaryOnly,
+                            parameters: version.args_schema,
+                        });
+                    }
+                }
+                Err(error) => {
+                    return Json(RpcResponse::failure(
+                        request.id,
+                        RpcError::internal_error(error.to_string()),
+                    ));
+                }
+            }
+            let value = serde_json::to_value(ToolsListResponse { tools: descriptors })
+                .unwrap_or_else(|_| serde_json::json!({ "tools": [] }));
             Json(RpcResponse::success(request.id, value))
+        }
+        RPC_TOOLS_MANAGEMENT => match tool_repo::management(&state.db).await {
+            Ok(tools) => {
+                let value = serde_json::to_value(ToolsManagementResponse { tools })
+                    .unwrap_or_else(|_| serde_json::json!({ "tools": [] }));
+                Json(RpcResponse::success(request.id, value))
+            }
+            Err(e) => Json(RpcResponse::failure(
+                request.id,
+                RpcError::internal_error(e.to_string()),
+            )),
+        },
+        RPC_TOOLS_SAVE_DRAFT => {
+            let Some(params) = request.params.clone() else {
+                return Json(RpcResponse::failure(
+                    request.id,
+                    RpcError::invalid_request(),
+                ));
+            };
+            let params: SaveDraftParams = match serde_json::from_value(params) {
+                Ok(params) => params,
+                Err(_) => {
+                    return Json(RpcResponse::failure(
+                        request.id,
+                        RpcError::invalid_request(),
+                    ));
+                }
+            };
+            match tool_repo::save_draft(&state.db, params).await {
+                Ok(row) => {
+                    let value = serde_json::to_value(row).unwrap_or(serde_json::Value::Null);
+                    Json(RpcResponse::success(request.id, value))
+                }
+                Err(e) => Json(RpcResponse::failure(
+                    request.id,
+                    RpcError::internal_error(e.to_string()),
+                )),
+            }
+        }
+        RPC_TOOLS_REGISTER => {
+            let Some(params) = request.params.clone() else {
+                return Json(RpcResponse::failure(
+                    request.id,
+                    RpcError::invalid_request(),
+                ));
+            };
+            let params: RegisterParams = match serde_json::from_value(params) {
+                Ok(params) => params,
+                Err(_) => {
+                    return Json(RpcResponse::failure(
+                        request.id,
+                        RpcError::invalid_request(),
+                    ));
+                }
+            };
+            let Ok(version_id) = uuid::Uuid::parse_str(&params.version_id) else {
+                return Json(RpcResponse::failure(
+                    request.id,
+                    RpcError::invalid_request(),
+                ));
+            };
+            match tool_repo::register_active(&state.db, version_id).await {
+                Ok(row) => {
+                    let value = serde_json::to_value(row).unwrap_or(serde_json::Value::Null);
+                    Json(RpcResponse::success(request.id, value))
+                }
+                Err(e) => Json(RpcResponse::failure(
+                    request.id,
+                    RpcError::internal_error(e.to_string()),
+                )),
+            }
+        }
+        RPC_TOOLS_DELETE_VERSION => {
+            let Some(params) = request.params.clone() else {
+                return Json(RpcResponse::failure(
+                    request.id,
+                    RpcError::invalid_request(),
+                ));
+            };
+            let params: DeleteVersionParams = match serde_json::from_value(params) {
+                Ok(params) => params,
+                Err(_) => {
+                    return Json(RpcResponse::failure(
+                        request.id,
+                        RpcError::invalid_request(),
+                    ));
+                }
+            };
+            let Ok(version_id) = uuid::Uuid::parse_str(&params.version_id) else {
+                return Json(RpcResponse::failure(
+                    request.id,
+                    RpcError::invalid_request(),
+                ));
+            };
+            match tool_repo::delete_version(&state.db, version_id).await {
+                Ok(deleted) => {
+                    let value = serde_json::to_value(DeleteAck { deleted })
+                        .unwrap_or(serde_json::Value::Null);
+                    Json(RpcResponse::success(request.id, value))
+                }
+                Err(e) => Json(RpcResponse::failure(
+                    request.id,
+                    RpcError::internal_error(e.to_string()),
+                )),
+            }
         }
         RPC_TOOLS_RESULT => {
             let Some(params) = request.params.clone() else {
