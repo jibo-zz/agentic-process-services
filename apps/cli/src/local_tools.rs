@@ -1,45 +1,39 @@
 use agentic_protocol::{LocalToolScript, ToolScriptLanguage};
 use agentic_tools::{
     WorkspaceGuard, execute_local_tool,
-    runner::{RunRequest, ScriptLanguage, run},
+    sandbox::{SandboxManager, SandboxRunKind, SandboxRunRequest},
 };
 use serde_json::Value;
-use std::{fs, path::PathBuf, time::Duration};
-use uuid::Uuid;
+use std::time::Duration;
 
 pub fn execute(guard: &WorkspaceGuard, name: &str, input: Value) -> Result<Value, String> {
     execute_local_tool(guard, name, input).map_err(|error| error.to_string())
 }
 
-/// Runs a Tier-2 (DB-authored) script in an isolated scratch directory under the workspace and
-/// returns a summary object. The scratch directory is removed after the run completes.
+/// Runs a Tier-2 (DB-authored) script through the sandbox manager and returns a summary object.
 pub async fn execute_tier2(
-    guard: &WorkspaceGuard,
+    _guard: &WorkspaceGuard,
+    sandbox_manager: &SandboxManager,
     input: Value,
     script: LocalToolScript,
 ) -> Result<Value, String> {
-    let scratch_root = guard.root().join(".agent-tools").join("scratch");
-    fs::create_dir_all(&scratch_root).map_err(|error| error.to_string())?;
-    let cwd: PathBuf = scratch_root.join(Uuid::new_v4().to_string());
-    fs::create_dir(&cwd).map_err(|error| error.to_string())?;
-
     let args_json = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_owned());
-    let language = match script.language {
-        ToolScriptLanguage::Python => ScriptLanguage::Python,
-        ToolScriptLanguage::Shell => ScriptLanguage::Shell,
+    let kind = match script.language {
+        ToolScriptLanguage::Python => SandboxRunKind::PythonScript,
+        ToolScriptLanguage::Shell => SandboxRunKind::ShellScript,
     };
     let timeout_ms = script.timeout_ms.max(100);
-    let request = RunRequest {
-        language,
+    let request = SandboxRunRequest {
+        kind,
         script: script.script,
         args_json,
         timeout: Duration::from_millis(timeout_ms),
-        cwd: cwd.clone(),
     };
 
-    let outcome = run(request).await.map_err(|error| error.to_string());
-    let _ = fs::remove_dir_all(&cwd);
-    let outcome = outcome?;
+    let outcome = sandbox_manager
+        .run_script(request)
+        .await
+        .map_err(|error| error.to_string())?;
 
     if outcome.timed_out {
         return Err(format!("Script timed out after {}ms", outcome.duration_ms));
@@ -60,6 +54,7 @@ pub async fn execute_tier2(
         .unwrap_or_else(|_| Value::String(outcome.stdout.clone()));
     let summary = format!("Script exit {exit_code} in {}ms", outcome.duration_ms);
     Ok(serde_json::json!({
+        "job_id": outcome.job_id,
         "output": parsed,
         "stdout": outcome.stdout,
         "stderr": outcome.stderr,

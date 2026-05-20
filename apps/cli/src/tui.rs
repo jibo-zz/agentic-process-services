@@ -30,7 +30,7 @@ use agentic_protocol::{
     AgentMode, AuthorRequest, ChatStreamEvent, LocalToolScript, SaveDraftParams, SessionSummary,
     ToolResultParams, ToolRisk, ToolVersionRow, ToolsListResponse, UiMessage,
 };
-use agentic_tools::WorkspaceGuard;
+use agentic_tools::{WorkspaceGuard, sandbox::SandboxManager};
 use cli::client::{FetchError, Fetcher};
 use cli::local_tools;
 
@@ -92,6 +92,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
     let fetcher = Fetcher::local();
     let workspace_guard = WorkspaceGuard::from_current_dir()
         .map_err(|error| color_eyre::eyre::eyre!(error.to_string()))?;
+    let sandbox_manager = SandboxManager::new(workspace_guard.root());
     let runtime = tokio::runtime::Runtime::new()?;
     let mut chat_rx: Option<mpsc::Receiver<ChatEvent>> = None;
     let mut chat_tx: Option<mpsc::Sender<ChatEvent>> = None;
@@ -341,6 +342,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                             &runtime,
                             &fetcher,
                             &workspace_guard,
+                            &sandbox_manager,
                             chat_tx.as_ref(),
                             event,
                         );
@@ -391,6 +393,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                             &runtime,
                             &fetcher,
                             &workspace_guard,
+                            &sandbox_manager,
                             chat_tx.as_ref(),
                             approval,
                             approved,
@@ -405,6 +408,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                                 &runtime,
                                 &fetcher,
                                 &workspace_guard,
+                                &sandbox_manager,
                                 tx,
                                 action,
                                 snapshot,
@@ -469,6 +473,7 @@ fn handle_chat_stream_event(
     runtime: &tokio::runtime::Runtime,
     fetcher: &Fetcher,
     workspace_guard: &WorkspaceGuard,
+    sandbox_manager: &SandboxManager,
     chat_tx: Option<&mpsc::Sender<ChatEvent>>,
     event: ChatStreamEvent,
 ) {
@@ -550,6 +555,7 @@ fn handle_chat_stream_event(
                         runtime,
                         fetcher.clone(),
                         workspace_guard.clone(),
+                        sandbox_manager.clone(),
                         tx,
                         stream_id,
                         stream_secret,
@@ -579,11 +585,13 @@ fn handle_chat_stream_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_tool_approval_decision(
     app: &mut App,
     runtime: &tokio::runtime::Runtime,
     fetcher: &Fetcher,
     workspace_guard: &WorkspaceGuard,
+    sandbox_manager: &SandboxManager,
     chat_tx: Option<&mpsc::Sender<ChatEvent>>,
     approval: PendingToolApproval,
     approved: bool,
@@ -622,6 +630,7 @@ fn handle_tool_approval_decision(
                 runtime,
                 fetcher.clone(),
                 workspace_guard.clone(),
+                sandbox_manager.clone(),
                 tx,
                 stream_id,
                 stream_secret,
@@ -700,6 +709,7 @@ fn spawn_tier2_tool(
     runtime: &tokio::runtime::Runtime,
     fetcher: Fetcher,
     guard: WorkspaceGuard,
+    sandbox_manager: SandboxManager,
     tx: mpsc::Sender<ChatEvent>,
     stream_id: String,
     stream_secret: String,
@@ -710,7 +720,7 @@ fn spawn_tier2_tool(
     render_ui: bool,
 ) {
     runtime.spawn(async move {
-        let result = local_tools::execute_tier2(&guard, input, script).await;
+        let result = local_tools::execute_tier2(&guard, &sandbox_manager, input, script).await;
         let (output, error) = match result {
             Ok(output) => (Some(output), None),
             Err(error) => (None, Some(error)),
@@ -835,6 +845,7 @@ fn dispatch_editor_action(
     runtime: &tokio::runtime::Runtime,
     fetcher: &Fetcher,
     workspace_guard: &WorkspaceGuard,
+    sandbox_manager: &SandboxManager,
     tx: mpsc::Sender<EditorEvent>,
     action: ToolEditorAction,
     snapshot: ToolEditorSnapshot,
@@ -844,10 +855,17 @@ fn dispatch_editor_action(
             runtime,
             fetcher.clone(),
             workspace_guard.clone(),
+            sandbox_manager.clone(),
             tx,
             snapshot,
         ),
-        ToolEditorAction::Run => spawn_editor_run(runtime, workspace_guard.clone(), tx, snapshot),
+        ToolEditorAction::Run => spawn_editor_run(
+            runtime,
+            workspace_guard.clone(),
+            sandbox_manager.clone(),
+            tx,
+            snapshot,
+        ),
         ToolEditorAction::SaveDraft => {
             spawn_editor_save_draft(runtime, fetcher.clone(), tx, snapshot)
         }
@@ -859,6 +877,7 @@ fn spawn_editor_generate(
     runtime: &tokio::runtime::Runtime,
     fetcher: Fetcher,
     guard: WorkspaceGuard,
+    sandbox_manager: SandboxManager,
     tx: mpsc::Sender<EditorEvent>,
     snapshot: ToolEditorSnapshot,
 ) {
@@ -927,7 +946,8 @@ fn spawn_editor_generate(
                     let _ = tx.send(EditorEvent::GenerationProgress {
                         line: format!("sandbox_run: {}", short_args(&input)),
                     });
-                    let outcome = local_tools::execute_tier2(&guard, input, script).await;
+                    let outcome =
+                        local_tools::execute_tier2(&guard, &sandbox_manager, input, script).await;
                     let (output, error) = match outcome {
                         Ok(v) => (Some(v), None),
                         Err(e) => (None, Some(e)),
@@ -1006,6 +1026,7 @@ fn short_args(value: &serde_json::Value) -> String {
 fn spawn_editor_run(
     runtime: &tokio::runtime::Runtime,
     guard: WorkspaceGuard,
+    sandbox_manager: SandboxManager,
     tx: mpsc::Sender<EditorEvent>,
     snapshot: ToolEditorSnapshot,
 ) {
@@ -1021,7 +1042,7 @@ fn spawn_editor_run(
             script: snapshot.script,
             timeout_ms: 10_000,
         };
-        match local_tools::execute_tier2(&guard, args, script).await {
+        match local_tools::execute_tier2(&guard, &sandbox_manager, args, script).await {
             Ok(value) => {
                 let stdout = value
                     .get("stdout")

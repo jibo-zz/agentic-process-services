@@ -1,5 +1,6 @@
 pub mod instructions;
 pub mod runner;
+pub mod sandbox;
 
 use agentic_protocol::{AgentMode, ToolDescriptor, ToolExecutionKind, ToolOutputPolicy, ToolRisk};
 use serde::{Deserialize, Serialize};
