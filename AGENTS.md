@@ -57,6 +57,7 @@
 ## Tool Author And Editor
 - `POST /author/stream` drives LLM-authored Tier-2 tool creation; it never writes to `sessions` or `messages`.
 - The author agent has exactly `set_draft`, `sandbox_run`, and `submit_tool`. It cannot recursively call the user-facing registry.
+- `submit_tool` is rejected unless at least one `sandbox_run` has been attempted for the current draft.
 - `submit_tool` only writes a draft. Tools are not callable by chat until published from `/tools`.
 - `/tools` loads `tools.list` and `tools.management` in parallel and merges them in `App::set_tools_from_server(...)`.
 - Keep `/tools` rendering in `apps/cli/src/ui/tools.rs`; keep route/input/state in `app.rs`; keep editor action dispatch in `tui.rs`.

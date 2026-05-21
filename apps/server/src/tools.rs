@@ -518,7 +518,7 @@ impl Tool for SubmitToolTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_owned(),
-            description: "Persist the verified script as a Tier-2 draft tool. Call this exactly once, after all sandbox_run test cases have been attempted. Ends the author loop.".to_owned(),
+            description: "Persist the verified script as a Tier-2 draft tool. This is rejected until sandbox_run has been called at least once for the current draft. Call this exactly once, after all sandbox_run test cases have been attempted. Ends the author loop.".to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -550,6 +550,12 @@ impl Tool for SubmitToolTool {
             let state = self.context.state.lock().map_err(|_| ProxyToolError {
                 message: "author state poisoned".to_owned(),
             })?;
+            if state.run_count == 0 {
+                return Err(ProxyToolError {
+                    message: "submit_tool requires at least one sandbox_run for the current draft"
+                        .to_owned(),
+                });
+            }
             state.draft.clone().ok_or_else(|| ProxyToolError {
                 message: "no draft registered; call set_draft first".to_owned(),
             })?
